@@ -83,7 +83,9 @@ function hasComputerUseLiteral(source) {
 }
 
 function isComputerUseNameExpr(nameExpr, computerUseNameVar) {
-  return /^(?:`computer-use`|"computer-use"|'computer-use')$/.test(nameExpr) || nameExpr === computerUseNameVar;
+  return /^(?:`computer-use`|"computer-use"|'computer-use')$/.test(nameExpr) ||
+    nameExpr === computerUseNameVar ||
+    /^[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*$/.test(nameExpr);
 }
 
 function applyLinuxComputerUsePluginGatePatch(currentSource) {
@@ -95,8 +97,10 @@ function applyLinuxComputerUsePluginGatePatch(currentSource) {
   }
 
   const computerUseNameVar = currentSource.match(/([A-Za-z_$][\w$]*)=(?:`computer-use`|"computer-use"|'computer-use')/)?.[1] ?? null;
+  const nameExpressionPattern = String.raw`(?:[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?|` +
+    String.raw`\`computer-use\`|"computer-use"|'computer-use')`;
   const gateRegex =
-    /\{(installWhenMissing:!0,)?name:([A-Za-z_$][\w$]*|`computer-use`|"computer-use"|'computer-use'),(isEnabled|isAvailable):\(\{([^}]*)\}\)=>([^{}]*?\.computerUse),migrate:([A-Za-z_$][\w$]*)\}/g;
+    new RegExp(String.raw`\{(installWhenMissing:!0,)?name:(${nameExpressionPattern}),(isEnabled|isAvailable):\(\{([^}]*)\}\)=>([^{}]*?\.computerUse),migrate:([A-Za-z_$][\w$]*)\}`, "g");
   let sawEnabledGate = false;
   let sawUnpatchableGate = false;
   let match;
@@ -170,10 +174,16 @@ function applyLinuxComputerUseRendererAvailabilityPatch(currentSource) {
   const platformPredicateNeedle = "function hae(e){return e===`macOS`||e===`windows`}";
   const platformPredicatePatch =
     "function hae(e){return e===`macOS`||e===`windows`||e===`linux`}";
+  const currentPlatformPredicateNeedle =
+    /function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\)\{return \2===`macOS`\|\|\2===`windows`\}/;
+  const currentPlatformPredicatePatch = (_, fnName, platformVar) =>
+    `function ${fnName}(${platformVar}){return ${platformVar}===\`macOS\`||${platformVar}===\`windows\`||${platformVar}===\`linux\`}`;
   if (patchedSource.includes(platformPredicatePatch)) {
     // Already patched.
   } else if (patchedSource.includes(platformPredicateNeedle)) {
     patchedSource = patchedSource.replace(platformPredicateNeedle, platformPredicatePatch);
+  } else if (currentPlatformPredicateNeedle.test(patchedSource)) {
+    patchedSource = patchedSource.replace(currentPlatformPredicateNeedle, currentPlatformPredicatePatch);
   }
 
   const availabilityNeedle =
@@ -194,6 +204,18 @@ function applyLinuxComputerUseRendererAvailabilityPatch(currentSource) {
     return patchedSource.replace(availabilityNeedle, availabilityPatch);
   }
 
+  const currentAvailabilityNeedle =
+    "let _=a&&i&&l&&(o||m),v=_&&!o&&p.enabled&&!p.isLoading,y=_&&p.isLoading,b=_&&(o||p.isLoading),x;";
+  const currentAvailabilityPatch =
+    "let _=a&&i&&(c===`linux`||l&&(o||m)),v=_&&!o&&(c===`linux`||p.enabled)&&!p.isLoading,y=_&&c!==`linux`&&p.isLoading,b=_&&(o||c!==`linux`&&p.isLoading),x;";
+  if (patchedSource.includes(currentAvailabilityPatch)) {
+    return patchedSource;
+  }
+
+  if (patchedSource.includes(currentAvailabilityNeedle)) {
+    return patchedSource.replace(currentAvailabilityNeedle, currentAvailabilityPatch);
+  }
+
   if (currentSource.includes("featureName:`computer_use`") && currentSource.includes("isComputerUseAvailable")) {
     console.warn(
       "WARN: Could not find Computer Use renderer availability gate — skipping Linux Computer Use UI availability patch",
@@ -208,6 +230,8 @@ function applyLinuxComputerUseInstallFlowPatch(currentSource) {
     "ne=f({featureName:`computer_use`,hostId:t}),re=!ne.isLoading&&ne.enabled,";
   const availabilityPatch =
     "ne=f({featureName:`computer_use`,hostId:t}),re=!ne.isLoading&&ne.enabled||navigator.userAgent.includes(`Linux`),";
+  const currentAvailabilityPattern =
+    /([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\(\{featureName:`computer_use`,hostId:([^}]+)\}\),([^;]{0,300}?)([A-Za-z_$][\w$]*)=!\1\.isLoading&&\1\.enabled,/;
 
   if (currentSource.includes(availabilityPatch)) {
     return currentSource;
@@ -215,6 +239,18 @@ function applyLinuxComputerUseInstallFlowPatch(currentSource) {
 
   if (currentSource.includes(availabilityNeedle)) {
     return currentSource.replace(availabilityNeedle, availabilityPatch);
+  }
+
+  if (/=[^=]+\.isLoading&&[^=]+\.enabled\|\|navigator\.userAgent\.includes\(`Linux`\),/.test(currentSource)) {
+    return currentSource;
+  }
+
+  if (currentAvailabilityPattern.test(currentSource)) {
+    return currentSource.replace(
+      currentAvailabilityPattern,
+      (_, queryVar, queryFn, hostExpr, between, availableVar) =>
+        `${queryVar}=${queryFn}({featureName:\`computer_use\`,hostId:${hostExpr}}),${between}${availableVar}=!${queryVar}.isLoading&&${queryVar}.enabled||navigator.userAgent.includes(\`Linux\`),`,
+    );
   }
 
   if (currentSource.includes("featureName:`computer_use`")) {

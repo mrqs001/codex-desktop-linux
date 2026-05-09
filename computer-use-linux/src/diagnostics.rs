@@ -1,8 +1,11 @@
-use crate::cosmic_helper;
+use crate::windowing::registry::{
+    self, COSMIC_WAYLAND_BACKEND, GNOME_SHELL_EXTENSION_BACKEND, GNOME_SHELL_INTROSPECT_BACKEND,
+    HYPRLAND_BACKEND, KWIN_BACKEND,
+};
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -68,6 +71,7 @@ pub struct WindowingReport {
     pub cosmic_helper: Check,
     pub kwin: Check,
     pub hyprland: Check,
+    pub backends: BTreeMap<String, Check>,
     pub can_list_windows: bool,
     pub can_focus_apps: bool,
     pub can_focus_windows: bool,
@@ -347,36 +351,26 @@ fn accessibility_report() -> AccessibilityReport {
 }
 
 fn windowing_report(platform: &PlatformReport) -> WindowingReport {
-    let gnome_shell_introspect = gdbus_call_check(
-        "org.gnome.Shell",
-        "/org/gnome/Shell/Introspect",
-        "org.gnome.Shell.Introspect.GetWindows",
-        &[],
-    );
-    let codex_gnome_shell_extension = gdbus_call_check(
-        "com.openai.Codex.WindowControl",
-        "/com/openai/Codex/WindowControl",
-        "com.openai.Codex.WindowControl.ListWindows",
-        &[],
-    );
-    let cosmic_helper = cosmic_windowing_check();
-    let kwin = kwin_windowing_check();
-    let hyprland = hyprland_windowing_check();
-    let can_list_windows = gnome_shell_introspect.ok
-        || codex_gnome_shell_extension.ok
-        || cosmic_helper.ok
-        || kwin.ok
-        || hyprland.ok;
-    let gnome_focus_apps = gdbus_introspect_contains(
-        "org.gnome.Shell",
-        "/org/gnome/Shell",
-        "org.gnome.Shell",
-        "FocusApp",
-    )
-    .ok;
-    let can_focus_apps = gnome_focus_apps || cosmic_helper.ok || kwin.ok || hyprland.ok;
-    let can_focus_windows =
-        codex_gnome_shell_extension.ok || cosmic_helper.ok || kwin.ok || hyprland.ok;
+    let probes = registry::probe_backends();
+    let backend_check = |id: &str| {
+        probes
+            .iter()
+            .find(|probe| probe.id == id)
+            .map(check_from_backend_probe)
+            .unwrap_or_else(|| Check::fail("backend probe did not run"))
+    };
+    let gnome_shell_introspect = backend_check(GNOME_SHELL_INTROSPECT_BACKEND);
+    let codex_gnome_shell_extension = backend_check(GNOME_SHELL_EXTENSION_BACKEND);
+    let cosmic_helper = backend_check(COSMIC_WAYLAND_BACKEND);
+    let kwin = backend_check(KWIN_BACKEND);
+    let hyprland = backend_check(HYPRLAND_BACKEND);
+    let backends = probes
+        .iter()
+        .map(|probe| (probe.id.to_string(), check_from_backend_probe(probe)))
+        .collect::<BTreeMap<_, _>>();
+    let can_list_windows = probes.iter().any(|probe| probe.can_list_windows);
+    let can_focus_apps = probes.iter().any(|probe| probe.can_focus_apps);
+    let can_focus_windows = probes.iter().any(|probe| probe.can_focus_windows);
     let note = if can_list_windows {
         if cosmic_helper.ok && is_cosmic_wayland_platform(platform) {
             "A COSMIC Wayland window backend is available for list_windows, focused_window, and targeted input verification."
@@ -398,6 +392,7 @@ fn windowing_report(platform: &PlatformReport) -> WindowingReport {
         cosmic_helper,
         kwin,
         hyprland,
+        backends,
         can_list_windows,
         can_focus_apps,
         can_focus_windows,
@@ -405,54 +400,11 @@ fn windowing_report(platform: &PlatformReport) -> WindowingReport {
     }
 }
 
-fn cosmic_windowing_check() -> Check {
-    match cosmic_helper::probe() {
-        Ok(probe) if probe.ok => Check::ok(probe.detail),
-        Ok(probe) => Check::fail(probe.detail),
-        Err(error) => Check::fail(error.to_string()),
-    }
-}
-
-fn kwin_windowing_check() -> Check {
-    let scripting = gdbus_introspect_contains(
-        "org.kde.KWin",
-        "/Scripting",
-        "org.kde.kwin.Scripting",
-        "loadScript",
-    );
-    if !scripting.ok {
-        return Check::fail(format!("KWin scripting unavailable: {}", scripting.detail));
-    }
-
-    Check::ok("KWin scripting is available on the session bus")
-}
-
-fn hyprland_windowing_check() -> Check {
-    match Command::new("hyprctl").args(["clients", "-j"]).output() {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            match serde_json::from_str::<serde_json::Value>(&stdout) {
-                Ok(serde_json::Value::Array(clients)) => Check::ok(format!(
-                    "hyprctl clients -j returned {} clients",
-                    clients.len()
-                )),
-                Ok(_) => Check::fail("hyprctl clients -j did not return a JSON array"),
-                Err(error) => {
-                    Check::fail(format!("hyprctl clients -j returned invalid JSON: {error}"))
-                }
-            }
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let detail = if !stderr.is_empty() { stderr } else { stdout };
-            Check::fail(if detail.is_empty() {
-                format!("exit status {}", output.status)
-            } else {
-                detail
-            })
-        }
-        Err(error) => Check::fail(error.to_string()),
+fn check_from_backend_probe(probe: &registry::BackendProbe) -> Check {
+    if probe.ok {
+        Check::ok(probe.detail.clone())
+    } else {
+        Check::fail(probe.detail.clone())
     }
 }
 
@@ -514,7 +466,14 @@ fn readiness_report(
         "Run setup_accessibility to enable GNOME accessibility before element-aware actions."
             .to_string()
     } else if !can_query_windows {
-        "Enable a supported window backend before using targeted keyboard input: GNOME Shell Introspect, the Codex GNOME Shell extension, the COSMIC Wayland helper, KWin/Plasma DBus scripting, or Hyprland hyprctl.".to_string()
+        format!(
+            "Enable a supported window backend before using targeted keyboard input: {}",
+            registry::descriptors()
+                .iter()
+                .map(|descriptor| descriptor.missing_hint)
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
     } else if !can_focus_windows {
         "Enable an exact-focus window backend before using window_id, title, or terminal-targeted input.".to_string()
     } else if !can_send_development_input {
@@ -655,34 +614,6 @@ fn gdbus_call_check(destination: &str, object_path: &str, method: &str, args: &[
     command_check_with_session_bus("gdbus", &command_args)
 }
 
-fn gdbus_introspect_contains(
-    destination: &str,
-    object_path: &str,
-    interface: &str,
-    member: &str,
-) -> Check {
-    let check = command_check_with_session_bus(
-        "gdbus",
-        &[
-            "introspect",
-            "--session",
-            "--dest",
-            destination,
-            "--object-path",
-            object_path,
-        ],
-    );
-    if !check.ok {
-        return check;
-    }
-
-    if check.detail.contains(interface) && check.detail.contains(member) {
-        Check::ok(format!("{interface}.{member} is available"))
-    } else {
-        Check::fail(format!("{interface}.{member} was not advertised"))
-    }
-}
-
 fn command_check(command: &str, args: &[&str]) -> Check {
     run_command(command, args, false)
 }
@@ -773,6 +704,7 @@ mod tests {
             cosmic_helper: Check::fail("missing"),
             kwin: Check::fail("not a KWin session"),
             hyprland: Check::fail("not a Hyprland session"),
+            backends: BTreeMap::new(),
             can_list_windows,
             can_focus_apps: true,
             can_focus_windows,

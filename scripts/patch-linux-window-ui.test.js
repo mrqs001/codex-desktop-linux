@@ -760,6 +760,19 @@ test("patches the current isAvailable Computer Use gate shape", () => {
   assert.equal((patched.match(/installWhenMissing:!0,name:ft/g) || []).length, 2);
 });
 
+test("patches Computer Use gates that use imported namespace constants", () => {
+  const source = [
+    "var lt=`computer-use`;",
+    "var Ur=[{autoInstallOptOutKey:e.Nn(e.Dn),forceReload:!0,installWhenMissing:!0,name:e.Dn,isAvailable:({features:e})=>e.inAppBrowserUseAllowed,migrate:$n},{name:e.kn,isAvailable:({features:e,platform:t})=>t===`darwin`&&e.computerUse,migrate:mr},{installWhenMissing:!0,name:e.kn,isAvailable:({buildFlavor:e,features:n,platform:r})=>t.T.isInternal(e)&&r===`win32`&&n.computerUse},{name:e.An,isAvailable:()=>!0}];",
+  ].join("");
+
+  const patched = applyPatchTwice(applyLinuxComputerUsePluginGatePatch, source);
+
+  assert.match(patched, /installWhenMissing:!0,name:e\.kn,isAvailable:\(\{features:e,platform:t\}\)=>\(t===`darwin`\|\|t===`linux`\)&&e\.computerUse,migrate:mr/);
+  assert.match(patched, /t\.T\.isInternal\(e\)&&r===`win32`&&n\.computerUse/);
+  assert.equal((patched.match(/installWhenMissing:!0,name:e\.kn/g) || []).length, 2);
+});
+
 test("fails hard when the Computer Use gate is recognizable but unpatchable", () => {
   assert.throws(
     () => applyLinuxComputerUsePluginGatePatch("var tn=`computer-use`;var x=[{name:tn,isEnabled:({features:e,platform:t})=>isMac(t)&&e.computerUse,migrate:wn}];"),
@@ -816,6 +829,20 @@ test("shows Computer Use plugin UI on Linux without the upstream rollout flag", 
   );
 });
 
+test("shows current Computer Use plugin UI on Linux without the upstream rollout flag", () => {
+  const source =
+    "function g(e){return e===`macOS`||e===`windows`}" +
+    "function _(e){let t=(0,d.c)(8),{enabled:n,hostId:r,isHostLocal:i}=e,a=n===void 0?!0:n,{isLoading:o,platform:c}=u(),l=s(`1506311413`),f;t[0]===r?f=t[1]:(f={featureName:`computer_use`,hostId:r},t[0]=r,t[1]=f);let p=h(f),m;t[2]===c?m=t[3]:(m=g(c),t[2]=c,t[3]=m);let _=a&&i&&l&&(o||m),v=_&&!o&&p.enabled&&!p.isLoading,y=_&&p.isLoading,b=_&&(o||p.isLoading),x;return x}";
+
+  const patched = applyPatchTwice(applyLinuxComputerUseRendererAvailabilityPatch, source);
+
+  assert.match(patched, /function g\(e\)\{return e===`macOS`\|\|e===`windows`\|\|e===`linux`\}/);
+  assert.match(
+    patched,
+    /let _=a&&i&&\(c===`linux`\|\|l&&\(o\|\|m\)\),v=_&&!o&&\(c===`linux`\|\|p\.enabled\)&&!p\.isLoading,y=_&&c!==`linux`&&p\.isLoading,b=_&&\(o\|\|c!==`linux`&&p\.isLoading\),x;/,
+  );
+});
+
 test("allows Computer Use install flow on Linux", () => {
   const patched = applyPatchTwice(
     applyLinuxComputerUseInstallFlowPatch,
@@ -825,6 +852,18 @@ test("allows Computer Use install flow on Linux", () => {
   assert.match(
     patched,
     /re=!ne\.isLoading&&ne\.enabled\|\|navigator\.userAgent\.includes\(`Linux`\)/,
+  );
+});
+
+test("allows current Computer Use install flow on Linux", () => {
+  const source =
+    "te=ne({featureName:`computer_use`,hostId:t}),z=B({hostId:t,isHostLocal:m}),ie=re({hostId:t,isHostLocal:m}),U=!te.isLoading&&te.enabled,G=z.available,oe=ie.available,";
+
+  const patched = applyPatchTwice(applyLinuxComputerUseInstallFlowPatch, source);
+
+  assert.equal(
+    patched,
+    "te=ne({featureName:`computer_use`,hostId:t}),z=B({hostId:t,isHostLocal:m}),ie=re({hostId:t,isHostLocal:m}),U=!te.isLoading&&te.enabled||navigator.userAgent.includes(`Linux`),G=z.available,oe=ie.available,",
   );
 });
 

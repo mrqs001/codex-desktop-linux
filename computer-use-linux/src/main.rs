@@ -6,6 +6,7 @@ mod remote_desktop;
 mod screenshot;
 mod server;
 mod terminal;
+mod windowing;
 mod windows;
 
 use anyhow::{Context, Result};

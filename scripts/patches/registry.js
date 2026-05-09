@@ -199,15 +199,15 @@ const COMPUTER_USE_UI_ASSET_PATCHES = [
   {
     name: "linux-computer-use-ui-availability",
     ciPolicy: OPT_IN,
-    pattern: /^use-model-settings-.*\.js$/,
+    pattern: /^(use-model-settings|use-in-app-browser-use-availability)-.*\.js$/,
     apply: applyLinuxComputerUseRendererAvailabilityPatch,
-    missingDescription: "model settings bundle",
+    missingDescription: "Computer Use availability bundle",
     skipDescription: "Linux Computer Use UI availability patch",
   },
   {
     name: "linux-computer-use-install-flow",
     ciPolicy: OPT_IN,
-    pattern: /^use-plugin-install-flow-.*\.js$/,
+    pattern: /^(use-plugin-install-flow|plugins-availability)-.*\.js$/,
     apply: applyLinuxComputerUseInstallFlowPatch,
     missingDescription: "plugin install flow bundle",
     skipDescription: "Linux Computer Use install flow patch",
