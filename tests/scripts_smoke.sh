@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 
+export CODEX_LINUX_FEATURES_CONFIG="$REPO_DIR/linux-features/features.example.json"
+
 cleanup() {
     rm -rf "$TMP_DIR"
 }
@@ -457,16 +459,22 @@ exit 99
 SCRIPT
     chmod +x "$bin_dir/makepkg" "$bin_dir/cargo"
 
-    TMPDIR="$ampersand_tmpdir" \
-    PATH="$bin_dir:$PATH" \
-    CAPTURE_DIR="$capture_dir" \
-    APP_DIR_OVERRIDE="$app_dir" \
-    DIST_DIR_OVERRIDE="$dist_dir" \
-    PACKAGE_WITH_UPDATER=0 \
-    PACKAGE_VERSION="2026.03.24.120000+manual" \
-    bash "$REPO_DIR/scripts/build-pacman.sh"
+    local package_path
+    package_path="$(
+        TMPDIR="$ampersand_tmpdir" \
+        PATH="$bin_dir:$PATH" \
+        CAPTURE_DIR="$capture_dir" \
+        APP_DIR_OVERRIDE="$app_dir" \
+        DIST_DIR_OVERRIDE="$dist_dir" \
+        PACKAGE_WITH_UPDATER=0 \
+        PACKAGE_VERSION="2026.03.24.120000+manual" \
+        bash "$REPO_DIR/scripts/build-pacman.sh"
+    )"
 
     assert_file_exists "$dist_dir/codex-desktop-2026.03.24.120000+manual-1-x86_64.pkg.tar.zst"
+    [ "$package_path" = "$dist_dir/codex-desktop-2026.03.24.120000+manual-1-x86_64.pkg.tar.zst" ] || fail "Expected build-pacman.sh to print built package path, got: $package_path"
+    assert_file_exists "$dist_dir/codex-desktop-latest.pkg.tar.zst"
+    [ "$(readlink "$dist_dir/codex-desktop-latest.pkg.tar.zst")" = "codex-desktop-2026.03.24.120000+manual-1-x86_64.pkg.tar.zst" ] || fail "Expected latest pacman symlink to point at built package"
     assert_file_exists "$capture_dir/PKGBUILD"
     assert_file_exists "$capture_dir/codex-desktop.install"
     assert_contains "$capture_dir/PKGBUILD" "pkgver=2026.03.24.120000+manual"

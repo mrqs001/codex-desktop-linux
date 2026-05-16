@@ -210,7 +210,7 @@ EOF
     # depends on the server returning a real response.
     local i
     for i in $(seq 1 40); do
-        curl --disable --silent --fail --max-time 0.2 "http://127.0.0.1:$PORT_OPEN/index.html" >/dev/null 2>&1 && return 0
+        curl --disable --silent --fail --max-time 1 "http://127.0.0.1:$PORT_OPEN/index.html" >/dev/null 2>&1 && return 0
         sleep 0.05
     done
     return 1

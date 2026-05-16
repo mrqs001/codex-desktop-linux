@@ -114,7 +114,10 @@ main() {
 		-print -quit 2>/dev/null || true)"
 	[ -f "$pkg_file" ] || error "makepkg did not produce a package"
 
+	ln -sfn "$(basename "$pkg_file")" "$DIST_DIR/${PACKAGE_NAME}-latest.pkg.tar.zst"
+
 	info "Built package: $pkg_file"
+	printf '%s\n' "$pkg_file"
 }
 
 main "$@"
