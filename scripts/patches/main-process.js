@@ -9,6 +9,35 @@ const {
   requireName,
 } = require("./shared.js");
 
+const LINUX_TITLEBAR_OVERLAY_HEIGHT = 30;
+const LINUX_TITLEBAR_OVERLAY_HELPER = "codexLinuxTitleBarOverlay";
+
+function linuxTitlebarOverlayHelperSource(
+  electronAlias,
+  lightBackgroundAlias,
+  lightSymbolAlias,
+  darkSymbolAlias,
+) {
+  return `function ${LINUX_TITLEBAR_OVERLAY_HELPER}(e=1){return{color:${electronAlias}.nativeTheme.shouldUseDarkColors?\`#111111\`:${lightBackgroundAlias},symbolColor:${electronAlias}.nativeTheme.shouldUseDarkColors?${lightSymbolAlias}:${darkSymbolAlias},height:Math.round(${LINUX_TITLEBAR_OVERLAY_HEIGHT}*e)}}`;
+}
+
+function ensureLinuxTitlebarOverlayHelper(source, anchorText, helperSource) {
+  if (source.includes(`function ${LINUX_TITLEBAR_OVERLAY_HELPER}(`)) {
+    return source;
+  }
+
+  const anchorIndex = source.indexOf(anchorText);
+  if (anchorIndex === -1) {
+    return null;
+  }
+
+  return (
+    source.slice(0, anchorIndex + anchorText.length) +
+    helperSource +
+    source.slice(anchorIndex + anchorText.length)
+  );
+}
+
 // Main-process patches adapt Electron shell behavior: windows, tray, menu,
 // single-instance handling, file manager integration, and packaged runtime glue.
 function applyLinuxFileManagerPatch(currentSource) {
@@ -91,9 +120,18 @@ function applyLinuxWindowOptionsPatch(currentSource, iconAsset) {
 }
 
 function applyLinuxNativeTitlebarPatch(currentSource) {
-  const patchedPrimaryTitlebarRegex =
-    /===`linux`\?\{titleBarStyle:`hidden`,titleBarOverlay:\{color:([A-Za-z_$][\w$]*)\.nativeTheme\.shouldUseDarkColors\?([A-Za-z_$][\w$]*):([A-Za-z_$][\w$]*),symbolColor:\1\.nativeTheme\.shouldUseDarkColors\?([A-Za-z_$][\w$]*):([A-Za-z_$][\w$]*),height:Math\.round\(([A-Za-z_$][\w$]*)\*[A-Za-z_$][\w$]*\)\}\}/;
+  const patchedPrimaryTitlebarRegex = new RegExp(
+    `===\`linux\`\\?\\{titleBarStyle:\`hidden\`,titleBarOverlay:${LINUX_TITLEBAR_OVERLAY_HELPER}\\(([A-Za-z_$][\\w$]*)\\)\\}`,
+  );
   const alreadyPatchedTitlebarMatch = currentSource.match(patchedPrimaryTitlebarRegex);
+  const helperFunctionRegex = new RegExp(
+    'function ' +
+      escapeRegExp(LINUX_TITLEBAR_OVERLAY_HELPER) +
+      '\\([^)]*\\)\\{return\\{color:([A-Za-z_$][\\w$]*)\\.nativeTheme\\.shouldUseDarkColors\\?`#111111`:([A-Za-z_$][\\w$]*),symbolColor:\\1\\.nativeTheme\\.shouldUseDarkColors\\?([A-Za-z_$][\\w$]*):([A-Za-z_$][\\w$]*),height:Math\\.round\\(' +
+      LINUX_TITLEBAR_OVERLAY_HEIGHT +
+      '\\*[A-Za-z_$][\\w$]*\\)\\}\\}',
+  );
+  const helperFunctionMatch = currentSource.match(helperFunctionRegex);
 
   const primaryTitlebarRegex =
     /case`primary`:return ([A-Za-z_$][\w$]*)===`darwin`\?([A-Za-z_$][\w$]*)\?\{titleBarStyle:`hiddenInset`,trafficLightPosition:([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\)\}:\{vibrancy:`menu`,titleBarStyle:`hiddenInset`,trafficLightPosition:\3\(\4\)\}:\1===`win32`(\|\|\1===`linux`)?\?\{titleBarStyle:`hidden`,titleBarOverlay:([A-Za-z_$][\w$]*)\(\4\)\}:\{titleBarStyle:`default`\};/g;
@@ -107,8 +145,6 @@ function applyLinuxNativeTitlebarPatch(currentSource) {
   let electronAlias;
   let lightSymbolAlias;
   let darkSymbolAlias;
-  let overlayHeightAlias;
-  let darkBackgroundAlias;
   let lightBackgroundAlias;
 
   if (primaryTitlebarMatch != null) {
@@ -126,25 +162,39 @@ function applyLinuxNativeTitlebarPatch(currentSource) {
       return currentSource;
     }
 
-    [, electronAlias, lightSymbolAlias, darkSymbolAlias, overlayHeightAlias] = overlayHelperMatch;
-    [, , , darkBackgroundAlias, lightBackgroundAlias] = linuxBackgroundMatch;
+    [, electronAlias, lightSymbolAlias, darkSymbolAlias] = overlayHelperMatch;
+    [, , , , lightBackgroundAlias] = linuxBackgroundMatch;
     const replacement =
-      `case\`primary\`:return ${platformAlias}===\`darwin\`?${opaqueWindowsAlias}?{titleBarStyle:\`hiddenInset\`,trafficLightPosition:${trafficLightAlias}(${zoomAlias})}:{vibrancy:\`menu\`,titleBarStyle:\`hiddenInset\`,trafficLightPosition:${trafficLightAlias}(${zoomAlias})}:${platformAlias}===\`win32\`?{titleBarStyle:\`hidden\`,titleBarOverlay:${overlayHelperAlias}(${zoomAlias})}:${platformAlias}===\`linux\`?{titleBarStyle:\`hidden\`,titleBarOverlay:{color:${electronAlias}.nativeTheme.shouldUseDarkColors?\`#111111\`:${lightBackgroundAlias},symbolColor:${electronAlias}.nativeTheme.shouldUseDarkColors?${lightSymbolAlias}:${darkSymbolAlias},height:Math.round(${overlayHeightAlias}*${zoomAlias})}}:{titleBarStyle:\`default\`};`;
+      `case\`primary\`:return ${platformAlias}===\`darwin\`?${opaqueWindowsAlias}?{titleBarStyle:\`hiddenInset\`,trafficLightPosition:${trafficLightAlias}(${zoomAlias})}:{vibrancy:\`menu\`,titleBarStyle:\`hiddenInset\`,trafficLightPosition:${trafficLightAlias}(${zoomAlias})}:${platformAlias}===\`win32\`?{titleBarStyle:\`hidden\`,titleBarOverlay:${overlayHelperAlias}(${zoomAlias})}:${platformAlias}===\`linux\`?{titleBarStyle:\`hidden\`,titleBarOverlay:${LINUX_TITLEBAR_OVERLAY_HELPER}(${zoomAlias})}:{titleBarStyle:\`default\`};`;
 
     primaryTitlebarRegex.lastIndex = 0;
     patchedSource = patchedSource.replace(primaryTitlebarRegex, replacement);
-  } else {
-    [, electronAlias, darkBackgroundAlias, lightBackgroundAlias, lightSymbolAlias, darkSymbolAlias, overlayHeightAlias] =
-      alreadyPatchedTitlebarMatch;
-    patchedSource = patchedSource.replace(
-      /(===`linux`\?\{titleBarStyle:`hidden`,titleBarOverlay:\{color:[A-Za-z_$][\w$]*\.nativeTheme\.shouldUseDarkColors\?)[A-Za-z_$][\w$]*(:[A-Za-z_$][\w$]*,symbolColor:)/,
-      "$1`#111111`$2",
+    patchedSource = ensureLinuxTitlebarOverlayHelper(
+      patchedSource,
+      overlayHelperMatch[0],
+      linuxTitlebarOverlayHelperSource(
+        electronAlias,
+        lightBackgroundAlias,
+        lightSymbolAlias,
+        darkSymbolAlias,
+      ),
     );
+    if (patchedSource == null) {
+      console.warn("WARN: Could not insert Linux titleBarOverlay helper — skipping Linux native titlebar patch");
+      return currentSource;
+    }
+  } else if (helperFunctionMatch != null) {
+    [, electronAlias, lightBackgroundAlias, lightSymbolAlias, darkSymbolAlias] = helperFunctionMatch;
+  } else {
+    console.warn("WARN: Could not derive Linux titleBarOverlay helper aliases — skipping Linux native titlebar patch");
+    return currentSource;
   }
 
   if (
     patchedSource.includes("process.platform!==`win32`&&process.platform!==`linux`") &&
-    /setTitleBarOverlay\(process\.platform===`linux`\?\{color:[A-Za-z_$][\w$]*\.nativeTheme\.shouldUseDarkColors\?`#111111`:/.test(patchedSource)
+    new RegExp(
+      `setTitleBarOverlay\\(process\\.platform===\`linux\`\\?${escapeRegExp(LINUX_TITLEBAR_OVERLAY_HELPER)}\\(`,
+    ).test(patchedSource)
   ) {
     return patchedSource;
   }
@@ -158,19 +208,21 @@ function applyLinuxNativeTitlebarPatch(currentSource) {
       "\\.nativeTheme\\.off\\(`updated`,\\3\\)\\}\\}",
   );
   let overlaySyncMatch = patchedSource.match(overlaySyncRegex);
+  let overlaySyncReplacementRegex = overlaySyncRegex;
   if (overlaySyncMatch == null) {
     const existingLinuxOverlaySyncRegex = new RegExp(
       "installWindowsTitleBarOverlaySync\\(([A-Za-z_$][\\w$]*),([A-Za-z_$][\\w$]*)\\)\\{if\\(\\(process\\.platform!==`win32`&&process\\.platform!==`linux`\\)\\|\\|\\2!==`primary`\\)return;let ([A-Za-z_$][\\w$]*)=\\(\\)=>\\{\\1\\.isDestroyed\\(\\)\\|\\|\\1\\.setTitleBarOverlay\\(process\\.platform===`linux`\\?\\{color:" +
         escapedElectronAlias +
         "\\.nativeTheme\\.shouldUseDarkColors\\?[A-Za-z_$][\\w$]*:[A-Za-z_$][\\w$]*,symbolColor:" +
         escapedElectronAlias +
-        "\\.nativeTheme\\.shouldUseDarkColors\\?[A-Za-z_$][\\w$]*:[A-Za-z_$][\\w$]*,height:Math\\.round\\([A-Za-z_$][\\w$]*\\*this\\.windowZooms\\.get\\(\\1\\.id\\)\\)\\}:([A-Za-z_$][\\w$]*)\\(this\\.windowZooms\\.get\\(\\1\\.id\\)\\)\\)\\};return " +
+        "\\.nativeTheme\\.shouldUseDarkColors\\?[A-Za-z_$][\\w$]*:[A-Za-z_$][\\w$]*,height:Math\\.round\\((?:[A-Za-z_$][\\w$]*|\\d+(?:\\.\\d+)?)\\*this\\.windowZooms\\.get\\(\\1\\.id\\)\\)\\}:([A-Za-z_$][\\w$]*)\\(this\\.windowZooms\\.get\\(\\1\\.id\\)\\)\\)\\};return " +
         escapedElectronAlias +
         "\\.nativeTheme\\.on\\(`updated`,\\3\\),\\3\\(\\),\\(\\)=>\\{" +
         escapedElectronAlias +
         "\\.nativeTheme\\.off\\(`updated`,\\3\\)\\}\\}",
     );
     overlaySyncMatch = patchedSource.match(existingLinuxOverlaySyncRegex);
+    overlaySyncReplacementRegex = existingLinuxOverlaySyncRegex;
   }
   if (overlaySyncMatch == null) {
     if (patchedSource.includes("installWindowsTitleBarOverlaySync")) {
@@ -180,11 +232,9 @@ function applyLinuxNativeTitlebarPatch(currentSource) {
   }
 
   const [, windowAlias, windowTypeAlias, updateAlias, windowsOverlayHelperAlias] = overlaySyncMatch;
-  const linuxOverlay =
-    `{color:${electronAlias}.nativeTheme.shouldUseDarkColors?\`#111111\`:${lightBackgroundAlias},symbolColor:${electronAlias}.nativeTheme.shouldUseDarkColors?${lightSymbolAlias}:${darkSymbolAlias},height:Math.round(${overlayHeightAlias}*this.windowZooms.get(${windowAlias}.id))}`;
   const overlaySyncReplacement =
-    `installWindowsTitleBarOverlaySync(${windowAlias},${windowTypeAlias}){if((process.platform!==\`win32\`&&process.platform!==\`linux\`)||${windowTypeAlias}!==\`primary\`)return;let ${updateAlias}=()=>{${windowAlias}.isDestroyed()||${windowAlias}.setTitleBarOverlay(process.platform===\`linux\`?${linuxOverlay}:${windowsOverlayHelperAlias}(this.windowZooms.get(${windowAlias}.id)))};return ${electronAlias}.nativeTheme.on(\`updated\`,${updateAlias}),${updateAlias}(),()=>{${electronAlias}.nativeTheme.off(\`updated\`,${updateAlias})}}`;
-  const replacedSource = patchedSource.replace(overlaySyncRegex, overlaySyncReplacement);
+    `installWindowsTitleBarOverlaySync(${windowAlias},${windowTypeAlias}){if((process.platform!==\`win32\`&&process.platform!==\`linux\`)||${windowTypeAlias}!==\`primary\`)return;let ${updateAlias}=()=>{${windowAlias}.isDestroyed()||${windowAlias}.setTitleBarOverlay(process.platform===\`linux\`?${LINUX_TITLEBAR_OVERLAY_HELPER}(this.windowZooms.get(${windowAlias}.id)):${windowsOverlayHelperAlias}(this.windowZooms.get(${windowAlias}.id)))};return ${electronAlias}.nativeTheme.on(\`updated\`,${updateAlias}),${updateAlias}(),()=>{${electronAlias}.nativeTheme.off(\`updated\`,${updateAlias})}}`;
+  const replacedSource = patchedSource.replace(overlaySyncReplacementRegex, overlaySyncReplacement);
   if (replacedSource !== patchedSource) {
     return replacedSource;
   }
@@ -235,7 +285,8 @@ function applyLinuxSetIconPatch(currentSource, iconAsset) {
   let patchedAny = false;
   const patchedSource = currentSource.replace(readyRegex, (match, windowVar, offset) => {
     const linuxPatch = `process.platform===\`linux\`&&${windowVar}.setIcon(${iconPathExpression}),`;
-    if (currentSource.slice(Math.max(0, offset - linuxPatch.length), offset) === linuxPatch) {
+    const prefix = currentSource.slice(Math.max(0, offset - Math.max(400, linuxPatch.length * 2)), offset);
+    if (prefix.includes(linuxPatch)) {
       return match;
     }
     patchedAny = true;
@@ -283,30 +334,97 @@ function applyLinuxReadyToShowWindowStatePatch(currentSource) {
   return currentSource;
 }
 
-function applyLinuxOpaqueBackgroundPatch(currentSource) {
-  if (
-    currentSource.includes("===`linux`&&!OM(") ||
-    /===`linux`&&![A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*\)\?\{backgroundColor:[^{}]+,backgroundMaterial:null\}/.test(currentSource)
-  ) {
+function applyLinuxResizeRepaintPatch(currentSource) {
+  const helperName = "codexLinuxInstallResizeRepaintHook";
+  const helper =
+    "function codexLinuxInstallResizeRepaintHook(e){if(!(process.platform===`linux`)||e.__codexLinuxResizeRepaintHookInstalled)return;e.__codexLinuxResizeRepaintHookInstalled=!0;let __codexResizeRepaintScheduled=!1,__codexResizeRepaint=()=>{__codexResizeRepaintScheduled||(__codexResizeRepaintScheduled=!0,setTimeout(()=>{if(__codexResizeRepaintScheduled=!1,e.isDestroyed())return;let __codexWebContents=e.webContents;__codexWebContents==null||__codexWebContents.isDestroyed?.()||typeof __codexWebContents.invalidate==`function`&&__codexWebContents.invalidate()},16))};e.on(`resize`,__codexResizeRepaint),e.on(`resized`,__codexResizeRepaint)}";
+  const readyToShowRegex =
+    /(^|[^A-Za-z0-9_$])((?:[A-Za-z_$][\w$]*&&)?)([A-Za-z_$][\w$]*)\.once\(`ready-to-show`,\(\)=>\{/g;
+  let patchedAny = false;
+  const patchedSource = currentSource.replace(
+    readyToShowRegex,
+    (match, leading, guardPrefix, windowVar, offset, source) => {
+      const linuxPatch = `process.platform===\`linux\`&&${helperName}(${windowVar}),`;
+      const insertionPoint = offset + leading.length;
+      const prefix = source.slice(Math.max(0, insertionPoint - Math.max(400, linuxPatch.length * 2)), insertionPoint);
+      if (prefix.includes(linuxPatch)) {
+        return match;
+      }
+      patchedAny = true;
+      return `${leading}${linuxPatch}${guardPrefix}${windowVar}.once(\`ready-to-show\`,()=>{`;
+    },
+  );
+
+  if (!patchedAny) {
+    if (currentSource.includes(`${helperName}(`)) {
+      return currentSource;
+    }
+    if (currentSource.includes("ready-to-show")) {
+      console.warn("WARN: Could not find ready-to-show hook — skipping Linux resize repaint patch");
+    }
     return currentSource;
+  }
+
+  if (patchedSource.includes(`function ${helperName}(`)) {
+    return patchedSource;
+  }
+
+  for (const prefix of ['"use strict";', "'use strict';"]) {
+    if (patchedSource.startsWith(prefix)) {
+      return `${prefix}${helper}${patchedSource.slice(prefix.length)}`;
+    }
+  }
+
+  return `${helper}${patchedSource}`;
+}
+
+function applyLinuxOpaqueBackgroundPatch(currentSource) {
+  let patchedSource = currentSource;
+  const shouldAlwaysOpaqueSurfaceRegex =
+    /shouldAlwaysUseOpaqueWindowSurface\(([A-Za-z_$][\w$]*)\)\{return\s*([A-Za-z_$][\w$]*)\(\{appearance:\1,opaqueWindowsEnabled:this\.isOpaqueWindowsEnabled\(\),platform:process\.platform\}\)\|\|!([A-Za-z_$][\w$]*)\(\)&&!([A-Za-z_$][\w$]*)\(\1\)\}/u;
+  const shouldAlwaysOpaqueSurfaceMatch = patchedSource.match(shouldAlwaysOpaqueSurfaceRegex);
+  if (shouldAlwaysOpaqueSurfaceMatch != null) {
+    const [
+      match,
+      appearanceParam,
+      opaqueSurfaceHelper,
+      nativeSurfaceCapabilityHelper,
+      transparentAppearancePredicate,
+    ] = shouldAlwaysOpaqueSurfaceMatch;
+    const replacement =
+      `shouldAlwaysUseOpaqueWindowSurface(${appearanceParam}){return process.platform===\`linux\`&&!${transparentAppearancePredicate}(${appearanceParam})||${opaqueSurfaceHelper}({appearance:${appearanceParam},opaqueWindowsEnabled:this.isOpaqueWindowsEnabled(),platform:process.platform})||!${nativeSurfaceCapabilityHelper}()&&!${transparentAppearancePredicate}(${appearanceParam})}`;
+    patchedSource = patchedSource.replace(match, replacement);
+  } else if (
+    /shouldAlwaysUseOpaqueWindowSurface\([A-Za-z_$][\w$]*\)\{return\s*process\.platform===`linux`&&!/.test(patchedSource)
+  ) {
+    // Already patched.
+  } else if (patchedSource.includes("shouldAlwaysUseOpaqueWindowSurface(")) {
+    console.warn("WARN: Could not find opaque surface mode predicate — skipping Linux opaque surface patch");
+  }
+
+  if (
+    patchedSource.includes("===`linux`&&!OM(") ||
+    /===`linux`&&![A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*\)\?\{backgroundColor:[^{}]+,backgroundMaterial:null\}/.test(patchedSource)
+  ) {
+    return patchedSource;
   }
 
   const colorConstRegex =
     /([A-Za-z_$][\w$]*)=`#00000000`,([A-Za-z_$][\w$]*)=`#000000`,([A-Za-z_$][\w$]*)=`#f9f9f9`/;
-  const colorMatch = currentSource.match(colorConstRegex);
+  const colorMatch = patchedSource.match(colorConstRegex);
 
   if (!colorMatch) {
     console.warn(
       "WARN: Could not find color constants (#00000000, #000000, #f9f9f9) — skipping background patch",
     );
-    return currentSource;
+    return patchedSource;
   }
 
   const [, transparentVar, darkVar, lightVar] = colorMatch;
 
   const currentFuncParamRegex =
     /function\s+[A-Za-z_$][\w$]*\(\{platform:([A-Za-z_$][\w$]*),appearance:([A-Za-z_$][\w$]*),opaqueWindowsEnabled:([A-Za-z_$][\w$]*),prefersDarkColors:([A-Za-z_$][\w$]*)\}\)\{return\s*\3&&!([A-Za-z_$][\w$]*)\(\2\)&&\(\1===`darwin`\|\|\1===`win32`\)\?/;
-  const currentFuncMatch = currentSource.match(currentFuncParamRegex);
+  const currentFuncMatch = patchedSource.match(currentFuncParamRegex);
   if (currentFuncMatch != null) {
     const [, platformParam, appearanceParam, , darkColorsParam, transparentAppearancePredicate] =
       currentFuncMatch;
@@ -315,24 +433,46 @@ function applyLinuxOpaqueBackgroundPatch(currentSource) {
     const linuxBgPrefix =
       `:${platformParam}===\`linux\`&&!${transparentAppearancePredicate}(${appearanceParam})?{backgroundColor:${darkColorsParam}?${darkVar}:${lightVar},backgroundMaterial:null}:`;
 
-    if (currentSource.includes(linuxBgPrefix)) {
-      return currentSource;
+    if (patchedSource.includes(linuxBgPrefix)) {
+      return patchedSource;
     }
-    if (currentSource.includes(win32Needle)) {
-      return currentSource.replace(win32Needle, `${linuxBgPrefix}${win32Needle.slice(1)}`);
+    if (patchedSource.includes(win32Needle)) {
+      return patchedSource.replace(win32Needle, `${linuxBgPrefix}${win32Needle.slice(1)}`);
     }
 
     console.warn("WARN: Could not find BrowserWindow background color needle — skipping background patch");
-    return currentSource;
+    return patchedSource;
+  }
+
+  const currentSurfaceFuncParamRegex =
+    /function\s+[A-Za-z_$][\w$]*\(\{platform:([A-Za-z_$][\w$]*),appearance:([A-Za-z_$][\w$]*),opaqueWindowSurfaceEnabled:([A-Za-z_$][\w$]*),prefersDarkColors:([A-Za-z_$][\w$]*)\}\)\{return\s*\3\?\{backgroundColor:\4\?([A-Za-z_$][\w$]*):([A-Za-z_$][\w$]*),backgroundMaterial:\1===`win32`\?`none`:null\}:\1===`win32`&&!([A-Za-z_$][\w$]*)\(\2\)\?/;
+  const currentSurfaceFuncMatch = patchedSource.match(currentSurfaceFuncParamRegex);
+  if (currentSurfaceFuncMatch != null) {
+    const [, platformParam, appearanceParam, , darkColorsParam, darkVarFromReturn, lightVarFromReturn, transparentAppearancePredicate] =
+      currentSurfaceFuncMatch;
+    const win32Needle =
+      `:${platformParam}===\`win32\`&&!${transparentAppearancePredicate}(${appearanceParam})?`;
+    const linuxBgPrefix =
+      `:${platformParam}===\`linux\`&&!${transparentAppearancePredicate}(${appearanceParam})?{backgroundColor:${darkColorsParam}?${darkVarFromReturn}:${lightVarFromReturn},backgroundMaterial:null}:`;
+
+    if (patchedSource.includes(linuxBgPrefix)) {
+      return patchedSource;
+    }
+    if (patchedSource.includes(win32Needle)) {
+      return patchedSource.replace(win32Needle, `${linuxBgPrefix}${win32Needle.slice(1)}`);
+    }
+
+    console.warn("WARN: Could not find BrowserWindow background color needle — skipping background patch");
+    return patchedSource;
   }
 
   const funcParamRegex =
     /function\s+[A-Za-z_$][\w$]*\(\{platform:([A-Za-z_$][\w$]*),appearance:([A-Za-z_$][\w$]*),opaqueWindowsEnabled:[A-Za-z_$][\w$]*,prefersDarkColors:([A-Za-z_$][\w$]*)\}\)\{return\s*\1===`win32`&&!([A-Za-z_$][\w$]*)\(\2\)/;
-  const funcMatch = currentSource.match(funcParamRegex);
+  const funcMatch = patchedSource.match(funcParamRegex);
 
   if (funcMatch == null) {
     console.warn("WARN: Could not find BrowserWindow background function signature — skipping background patch");
-    return currentSource;
+    return patchedSource;
   }
 
   const [, platformParam, appearanceParam, darkColorsParam, transparentAppearancePredicate] =
@@ -344,14 +484,77 @@ function applyLinuxOpaqueBackgroundPatch(currentSource) {
   const bgReplacement =
     `backgroundMaterial:\`mica\`}:${platformParam}===\`linux\`&&!${transparentAppearancePredicate}(${appearanceParam})?{backgroundColor:${darkColorsParam}?${darkVar}:${lightVar},backgroundMaterial:null}:{backgroundColor:${transparentVar},backgroundMaterial:null}}`;
 
-  if (currentSource.includes(bgNeedle)) {
-    return currentSource.replace(bgNeedle, bgReplacement);
+  if (patchedSource.includes(bgNeedle)) {
+    return patchedSource.replace(bgNeedle, bgReplacement);
   }
-  if (currentSource.includes(oldLinuxBgPatch)) {
-    return currentSource.replace(oldLinuxBgPatch, bgReplacement);
+  if (patchedSource.includes(oldLinuxBgPatch)) {
+    return patchedSource.replace(oldLinuxBgPatch, bgReplacement);
   }
 
   console.warn("WARN: Could not find BrowserWindow background color needle — skipping background patch");
+  return patchedSource;
+}
+
+function applyLinuxAboutDialogPatch(currentSource, iconPathExpression) {
+  if (!currentSource.includes("codex.aboutDialog.title")) {
+    return currentSource;
+  }
+
+  const alreadyUsesBundledIcon =
+    iconPathExpression != null &&
+    currentSource.includes(`nativeImage.createFromPath(${iconPathExpression})`);
+  const aboutHtmlIconNullSafeRegex =
+    /[A-Za-z_$][\w$]*==null\|\|([A-Za-z_$][\w$]*)\.isEmpty\(\)\?null:\1\.resize\(/;
+  const aboutWindowIconNullSafeRegex =
+    /\.\.\.([A-Za-z_$][\w$]*)\.windowIcon==null\|\|\1\.windowIcon\.isEmpty\(\)\?\{\}:\{icon:\1\.windowIcon\}/;
+  const alreadyNullSafe =
+    aboutWindowIconNullSafeRegex.test(currentSource) &&
+    aboutHtmlIconNullSafeRegex.test(currentSource) &&
+    /windowIcon:[A-Za-z_$][\w$]*\?\?null\}/.test(currentSource);
+  if (alreadyUsesBundledIcon && alreadyNullSafe) {
+    return currentSource;
+  }
+
+  let patchedSource = currentSource;
+  if (iconPathExpression != null) {
+    const aboutIconPromiseRegex =
+      /\[([A-Za-z_$][\w$]*)\?([A-Za-z_$][\w$]*)\(([^()]+)\):null,([A-Za-z_$][\w$]*)\.app\.getFileIcon\(([^()]+),\{size:process\.platform===`win32`\?`large`:`normal`\}\)\]/;
+    patchedSource = patchedSource.replace(
+      aboutIconPromiseRegex,
+      `[
+process.platform===\`linux\`?null:$1?$2($3):null,
+process.platform===\`linux\`?Promise.resolve((()=>{let __codexLinuxAboutIcon=$4.nativeImage.createFromPath(${iconPathExpression});return __codexLinuxAboutIcon.isEmpty()?null:__codexLinuxAboutIcon})()):$4.app.getFileIcon($5,{size:process.platform===\`win32\`?\`large\`:\`normal\`}).catch(()=>null)
+]`,
+    );
+  } else {
+    const patchedGetFileIconRegex =
+      /([A-Za-z_$][\w$]*)\.app\.getFileIcon\(([^()]+),\{size:process\.platform===`win32`\?`large`:`normal`\}\)\.catch\(\(\)=>null\)/;
+    if (!patchedGetFileIconRegex.test(patchedSource)) {
+      const getFileIconRegex =
+        /([A-Za-z_$][\w$]*)\.app\.getFileIcon\(([^()]+),\{size:process\.platform===`win32`\?`large`:`normal`\}\)/;
+      patchedSource = patchedSource.replace(
+        getFileIconRegex,
+        "$1.app.getFileIcon($2,{size:process.platform===`win32`?`large`:`normal`}).catch(()=>null)",
+      );
+    }
+  }
+
+  patchedSource = patchedSource
+    .replace(
+      /([A-Za-z_$][\w$]*)\.isEmpty\(\)\?null:\1\.resize\(/g,
+      "$1==null||$1.isEmpty()?null:$1.resize(",
+    )
+    .replace(/windowIcon:([A-Za-z_$][\w$]*)\}/g, "windowIcon:$1??null}")
+    .replace(
+      /\.\.\.([A-Za-z_$][\w$]*)\.windowIcon\.isEmpty\(\)\?\{\}:\{icon:\1\.windowIcon\}/g,
+      "...$1.windowIcon==null||$1.windowIcon.isEmpty()?{}:{icon:$1.windowIcon}",
+    );
+
+  if (patchedSource !== currentSource) {
+    return patchedSource;
+  }
+
+  console.warn("WARN: Could not patch About dialog icon fallback for Linux");
   return currentSource;
 }
 
@@ -380,7 +583,7 @@ function findDynamicTraySetup(source) {
   while ((match = setupRegex.exec(source)) != null) {
     const [, setupFn, factoryFn] = match;
     if (isTrayFactoryFunction(source, factoryFn)) {
-      return { setupFn, index: match.index };
+      return { setupFn, factoryFn, index: match.index };
     }
   }
   return null;
@@ -390,6 +593,47 @@ function findDynamicTrayStartupCall(source, setupFn, startIndex) {
   const startupRegex = new RegExp(`([A-Za-z_$][\\w$]*)&&${escapeRegExp(setupFn)}\\(\\);`, "g");
   startupRegex.lastIndex = startIndex;
   return startupRegex.exec(source);
+}
+
+function addDynamicTraySetupFailureLogging(source, traySetup) {
+  const logMessage = "[codex-linux] Failed to set up system tray";
+  if (traySetup == null || source.includes(logMessage)) {
+    return source;
+  }
+
+  const openIndex = source.indexOf("{", traySetup.index);
+  if (openIndex === -1) {
+    return source;
+  }
+  const closeIndex = findMatchingBrace(source, openIndex);
+  if (closeIndex === -1) {
+    return source;
+  }
+
+  const body = source.slice(openIndex, closeIndex + 1);
+  if (!body.includes(`await ${traySetup.factoryFn}(`)) {
+    return source;
+  }
+
+  const catchRegex = /catch\(([A-Za-z_$][\w$]*)\)\{/;
+  const catchMatch = body.match(catchRegex);
+  if (catchMatch == null) {
+    return source;
+  }
+
+  const [, errorVar] = catchMatch;
+  const catchOpenIndex = catchMatch.index + catchMatch[0].length - 1;
+  const catchCloseIndex = findMatchingBrace(body, catchOpenIndex);
+  if (catchCloseIndex === -1) {
+    return source;
+  }
+
+  const catchBody = body.slice(catchOpenIndex + 1, catchCloseIndex);
+  const separator = catchBody.trim().length === 0 || /[;,]$/.test(catchBody.trim()) ? "" : ";";
+  const linuxWarning = `${separator}process.platform===\`linux\`&&console.warn(\`${logMessage}\`,${errorVar})`;
+  const patchedBody =
+    `${body.slice(0, catchCloseIndex)}${linuxWarning}${body.slice(catchCloseIndex)}`;
+  return `${source.slice(0, openIndex)}${patchedBody}${source.slice(closeIndex + 1)}`;
 }
 
 function applyLinuxQuitGuardPatch(currentSource) {
@@ -594,6 +838,8 @@ function applyLinuxExplicitIpcQuitPatch(currentSource) {
 function applyLinuxTrayPatch(currentSource, iconPathExpression) {
   let patchedSource = currentSource;
   const electronVar = requireName(currentSource, "electron") ?? "n";
+  const packagedTrayIconPathExpression = "process.resourcesPath+`/../.codex-linux/codex-desktop-tray.png`";
+  const packagedAppIconPathExpression = "process.resourcesPath+`/../.codex-linux/codex-desktop.png`";
 
   const trayGuardNeedle =
     "process.platform!==`win32`&&process.platform!==`darwin`?null:";
@@ -617,8 +863,11 @@ function applyLinuxTrayPatch(currentSource, iconPathExpression) {
     const trayIconNeedle =
       `for(let e of o){let t=${electronVar}.nativeImage.createFromPath(e);if(!t.isEmpty())return{defaultIcon:t,chronicleRunningIcon:null}}return{defaultIcon:await ${electronVar}.app.getFileIcon(process.execPath,{size:process.platform===\`win32\`?\`small\`:\`normal\`}),chronicleRunningIcon:null}}`;
     const trayIconPatch =
-      `for(let e of o){let t=${electronVar}.nativeImage.createFromPath(e);if(!t.isEmpty())return{defaultIcon:t,chronicleRunningIcon:null}}if(process.platform===\`linux\`){let e=${electronVar}.nativeImage.createFromPath(${iconPathExpression});if(!e.isEmpty())return{defaultIcon:e,chronicleRunningIcon:null}}return{defaultIcon:await ${electronVar}.app.getFileIcon(process.execPath,{size:process.platform===\`win32\`?\`small\`:\`normal\`}),chronicleRunningIcon:null}}`;
-    if (patchedSource.includes(`nativeImage.createFromPath(${iconPathExpression})`)) {
+      `for(let e of o){let t=${electronVar}.nativeImage.createFromPath(e);if(!t.isEmpty())return{defaultIcon:t,chronicleRunningIcon:null}}if(process.platform===\`linux\`){let __codexLinuxTrayIcon=${electronVar}.nativeImage.createFromPath(${packagedTrayIconPathExpression});if(!__codexLinuxTrayIcon.isEmpty())return{defaultIcon:__codexLinuxTrayIcon,chronicleRunningIcon:null};let __codexLinuxAppIcon=${electronVar}.nativeImage.createFromPath(${packagedAppIconPathExpression});if(!__codexLinuxAppIcon.isEmpty())return{defaultIcon:__codexLinuxAppIcon,chronicleRunningIcon:null};let __codexLinuxUpstreamTrayIcon=${electronVar}.nativeImage.createFromPath(${iconPathExpression});if(!__codexLinuxUpstreamTrayIcon.isEmpty())return{defaultIcon:__codexLinuxUpstreamTrayIcon,chronicleRunningIcon:null}}return{defaultIcon:await ${electronVar}.app.getFileIcon(process.execPath,{size:process.platform===\`win32\`?\`small\`:\`normal\`}),chronicleRunningIcon:null}}`;
+    if (
+      patchedSource.includes(`nativeImage.createFromPath(${packagedTrayIconPathExpression})`) ||
+      patchedSource.includes(`nativeImage.createFromPath(${packagedAppIconPathExpression})`)
+    ) {
       // Already patched.
     } else if (patchedSource.includes(trayIconNeedle)) {
       patchedSource = patchedSource.replace(trayIconNeedle, trayIconPatch);
@@ -628,7 +877,7 @@ function applyLinuxTrayPatch(currentSource, iconPathExpression) {
       patchedSource = patchedSource.replace(
         /for\(let ([A-Za-z_$][\w$]*) of ([A-Za-z_$][\w$]*)\)\{let ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.nativeImage\.createFromPath\(\1\);if\(!\3\.isEmpty\(\)\)return\{defaultIcon:\3,chronicleRunningIcon:null\}\}return\{defaultIcon:await \4\.app\.getFileIcon\(process\.execPath,\{size:process\.platform===`win32`\?`small`:`normal`\}\),chronicleRunningIcon:null\}\}/,
         (_match, iconPathVar, candidatesVar, imageVar, electronAlias) =>
-          `for(let ${iconPathVar} of ${candidatesVar}){let ${imageVar}=${electronAlias}.nativeImage.createFromPath(${iconPathVar});if(!${imageVar}.isEmpty())return{defaultIcon:${imageVar},chronicleRunningIcon:null}}if(process.platform===\`linux\`){let ${iconPathVar}=${electronAlias}.nativeImage.createFromPath(${iconPathExpression});if(!${iconPathVar}.isEmpty())return{defaultIcon:${iconPathVar},chronicleRunningIcon:null}}return{defaultIcon:await ${electronAlias}.app.getFileIcon(process.execPath,{size:process.platform===\`win32\`?\`small\`:\`normal\`}),chronicleRunningIcon:null}}`,
+          `for(let ${iconPathVar} of ${candidatesVar}){let ${imageVar}=${electronAlias}.nativeImage.createFromPath(${iconPathVar});if(!${imageVar}.isEmpty())return{defaultIcon:${imageVar},chronicleRunningIcon:null}}if(process.platform===\`linux\`){let __codexLinuxTrayIcon=${electronAlias}.nativeImage.createFromPath(${packagedTrayIconPathExpression});if(!__codexLinuxTrayIcon.isEmpty())return{defaultIcon:__codexLinuxTrayIcon,chronicleRunningIcon:null};let __codexLinuxAppIcon=${electronAlias}.nativeImage.createFromPath(${packagedAppIconPathExpression});if(!__codexLinuxAppIcon.isEmpty())return{defaultIcon:__codexLinuxAppIcon,chronicleRunningIcon:null};let __codexLinuxUpstreamTrayIcon=${electronAlias}.nativeImage.createFromPath(${iconPathExpression});if(!__codexLinuxUpstreamTrayIcon.isEmpty())return{defaultIcon:__codexLinuxUpstreamTrayIcon,chronicleRunningIcon:null}}return{defaultIcon:await ${electronAlias}.app.getFileIcon(process.execPath,{size:process.platform===\`win32\`?\`small\`:\`normal\`}),chronicleRunningIcon:null}}`,
       );
     } else {
       console.warn("WARN: Could not find tray icon fallback — skipping Linux tray icon patch");
@@ -781,11 +1030,52 @@ function applyLinuxTrayPatch(currentSource, iconPathExpression) {
     }
   }
 
+  const traySetupForDiagnostics = findDynamicTraySetup(patchedSource);
+  const sourceWithTrayDiagnostics = addDynamicTraySetupFailureLogging(
+    patchedSource,
+    traySetupForDiagnostics,
+  );
+  if (
+    traySetupForDiagnostics != null &&
+    sourceWithTrayDiagnostics === patchedSource &&
+    !patchedSource.includes("[codex-linux] Failed to set up system tray")
+  ) {
+    console.warn("WARN: Could not find tray setup catch handler — skipping Linux tray diagnostics patch");
+  }
+  patchedSource = sourceWithTrayDiagnostics;
+
   return patchedSource;
 }
 
 function buildLinuxBuildInfoHelpers(electronVar, fsVar, pathVar) {
-  return `function codexLinuxBuildInfoPaths(){let e=[];try{e.push((0,${pathVar}.join)(process.resourcesPath,\`codex-linux-build-info.json\`)),e.push((0,${pathVar}.join)(process.resourcesPath,\`..\`,\`.codex-linux\`,\`build-info.json\`))}catch{}return e}function codexLinuxReadBuildInfo(){for(let e of codexLinuxBuildInfoPaths())try{if(${fsVar}.existsSync(e)){let t=JSON.parse(${fsVar}.readFileSync(e,\`utf8\`));return t&&typeof t===\`object\`&&!Array.isArray(t)?t:null}}catch{}return null}function codexLinuxBuildInfoValue(e,t=\`unknown\`){return typeof e===\`string\`&&e.trim().length>0?e:Array.isArray(e)&&e.length>0?e.join(\`, \`):e==null?t:String(e)}function codexLinuxBuildInfoCommitUrl(e){let t=e?.source?.commitUrl;return typeof t===\`string\`&&/^https:\\/\\/github\\.com\\/[^/\\s]+\\/[^/\\s]+\\/commit\\/[0-9a-f]{7,40}$/i.test(t)?t:null}function codexLinuxBuildInfoDetail(e){if(!e)return\`No Linux build metadata file was found in this app install.\`;let t=e.linuxTarget??{},n=t.distro??{},r=e.upstreamDmg??{},i=e.source??{},a=e.linuxFeatures?.enabled??[],o=e.packageProfile??{},s=i.shortCommit||i.commit,c=s?i.dirty?\`\${s} (dirty)\`:s:\`unknown\`,l=n.prettyName||[n.id,n.versionId].filter(Boolean).join(\` \`)||\`unknown\`,u=codexLinuxBuildInfoCommitUrl(e);return[\`Linux package profile: \${codexLinuxBuildInfoValue(o.label)}\`,\`Distro: \${l}\`,\`Package manager: \${codexLinuxBuildInfoValue(t.packageManager??o.packageManager)}\`,\`Package format: \${codexLinuxBuildInfoValue(t.packageFormat??o.format)}\`,\`Enabled features: \${a.length>0?a.join(\`, \`):\`none\`}\`,\`Upstream app version: \${codexLinuxBuildInfoValue(r.appVersion)}\`,\`Upstream DMG SHA256: \${codexLinuxBuildInfoValue(r.sha256)}\`,\`Electron: \${codexLinuxBuildInfoValue(e.electronVersion)}\`,\`Linux source revision: \${c}\`,...(u?[\`Source commit URL: \${u}\`]:[]),\`Source branch: \${codexLinuxBuildInfoValue(i.branch)}\`,\`Generated: \${codexLinuxBuildInfoValue(e.generatedAt)}\`].join(\`\\n\`)}async function codexLinuxShowBuildInfo(){try{let e=codexLinuxReadBuildInfo(),t=codexLinuxBuildInfoCommitUrl(e),n=t?[\`Open Commit\`,\`OK\`]:[\`OK\`],r=await ${electronVar}.dialog?.showMessageBox({type:\`info\`,buttons:n,defaultId:t?1:0,cancelId:t?1:0,noLink:!0,message:\`Codex Desktop Linux build information\`,detail:codexLinuxBuildInfoDetail(e)});t&&r?.response===0&&await ${electronVar}.shell?.openExternal(t)}catch{}}`;
+  return `function codexLinuxBuildInfoPaths(){let __codexBuildInfoPaths=[];try{__codexBuildInfoPaths.push((0,${pathVar}.join)(process.resourcesPath,\`codex-linux-build-info.json\`)),__codexBuildInfoPaths.push((0,${pathVar}.join)(process.resourcesPath,\`..\`,\`.codex-linux\`,\`build-info.json\`))}catch{}return __codexBuildInfoPaths}function codexLinuxReadBuildInfo(){for(let __codexBuildInfoPath of codexLinuxBuildInfoPaths())try{if(${fsVar}.existsSync(__codexBuildInfoPath)){let __codexBuildInfo=JSON.parse(${fsVar}.readFileSync(__codexBuildInfoPath,\`utf8\`));if(__codexBuildInfo&&typeof __codexBuildInfo===\`object\`&&!Array.isArray(__codexBuildInfo))return{info:__codexBuildInfo,path:__codexBuildInfoPath}}}catch{}return{info:null,path:null}}function codexLinuxBuildInfoValue(__codexBuildInfoValue,__codexBuildInfoFallback=\`unknown\`){return typeof __codexBuildInfoValue===\`string\`&&__codexBuildInfoValue.trim().length>0?__codexBuildInfoValue:Array.isArray(__codexBuildInfoValue)&&__codexBuildInfoValue.length>0?__codexBuildInfoValue.join(\`, \`):__codexBuildInfoValue==null?__codexBuildInfoFallback:String(__codexBuildInfoValue)}function codexLinuxBuildInfoCommitUrl(__codexBuildInfo){let __codexBuildInfoCommitUrl=__codexBuildInfo?.source?.commitUrl;return typeof __codexBuildInfoCommitUrl===\`string\`&&/^https:\\/\\/github\\.com\\/[^/\\s]+\\/[^/\\s]+\\/commit\\/[0-9a-f]{7,40}$/i.test(__codexBuildInfoCommitUrl)?__codexBuildInfoCommitUrl:null}function codexLinuxGetBuildInfo(){let __codexBuildInfoResult=codexLinuxReadBuildInfo();return{...__codexBuildInfoResult,commitUrl:codexLinuxBuildInfoCommitUrl(__codexBuildInfoResult.info)}}function codexLinuxBuildInfoDetail(__codexBuildInfo,__codexBuildInfoPath){if(!__codexBuildInfo)return\`No Linux build metadata file was found in this app install.\`;let __codexBuildInfoTarget=__codexBuildInfo.linuxTarget??{},__codexBuildInfoDistro=__codexBuildInfoTarget.distro??{},__codexBuildInfoDmg=__codexBuildInfo.upstreamDmg??{},__codexBuildInfoSource=__codexBuildInfo.source??{},__codexBuildInfoFeatures=__codexBuildInfo.linuxFeatures?.enabled??[],__codexBuildInfoProfile=__codexBuildInfo.packageProfile??{},__codexBuildInfoCommit=__codexBuildInfoSource.commit||__codexBuildInfoSource.shortCommit,__codexBuildInfoCommitValue=__codexBuildInfoCommit?__codexBuildInfoSource.dirty?\`\${__codexBuildInfoCommit} (dirty)\`:__codexBuildInfoCommit:\`unknown\`,__codexBuildInfoDistroValue=__codexBuildInfoDistro.prettyName||[__codexBuildInfoDistro.id,__codexBuildInfoDistro.versionId].filter(Boolean).join(\` \`)||\`unknown\`,__codexBuildInfoCommitLink=codexLinuxBuildInfoCommitUrl(__codexBuildInfo);return[\`Metadata file: \${codexLinuxBuildInfoValue(__codexBuildInfoPath)}\`,\`Linux package profile: \${codexLinuxBuildInfoValue(__codexBuildInfoProfile.label)}\`,\`Distro: \${__codexBuildInfoDistroValue}\`,\`Package manager: \${codexLinuxBuildInfoValue(__codexBuildInfoTarget.packageManager??__codexBuildInfoProfile.packageManager)}\`,\`Package format: \${codexLinuxBuildInfoValue(__codexBuildInfoTarget.packageFormat??__codexBuildInfoProfile.format)}\`,\`Enabled features: \${__codexBuildInfoFeatures.length>0?__codexBuildInfoFeatures.join(\`, \`):\`none\`}\`,\`Upstream app version: \${codexLinuxBuildInfoValue(__codexBuildInfoDmg.appVersion)}\`,\`Upstream DMG SHA256: \${codexLinuxBuildInfoValue(__codexBuildInfoDmg.sha256)}\`,\`Electron: \${codexLinuxBuildInfoValue(__codexBuildInfo.electronVersion)}\`,\`Linux source commit: \${__codexBuildInfoCommitValue}\`,...(__codexBuildInfoCommitLink?[\`Source commit URL: \${__codexBuildInfoCommitLink}\`]:[]),\`Source branch: \${codexLinuxBuildInfoValue(__codexBuildInfoSource.branch)}\`,\`Generated: \${codexLinuxBuildInfoValue(__codexBuildInfo.generatedAt)}\`].join(\`\\n\`)}async function codexLinuxOpenBuildInfoCommit(){let __codexBuildInfoResult=codexLinuxGetBuildInfo();return __codexBuildInfoResult.commitUrl?(await ${electronVar}.shell?.openExternal(__codexBuildInfoResult.commitUrl),{success:!0}):{success:!1}}async function codexLinuxShowBuildInfo(){try{let __codexBuildInfoResult=codexLinuxGetBuildInfo(),__codexBuildInfoCommitUrl=__codexBuildInfoResult.commitUrl,__codexBuildInfoPath=__codexBuildInfoResult.path,__codexBuildInfoButtons=[],__codexBuildInfoButtonIndex=0;__codexBuildInfoCommitUrl&&__codexBuildInfoButtons.push(\`Open Source Commit\`),__codexBuildInfoPath&&__codexBuildInfoButtons.push(\`Open Metadata File\`),__codexBuildInfoButtons.push(\`OK\`);let __codexBuildInfoBoxResponse=await ${electronVar}.dialog?.showMessageBox({type:\`info\`,buttons:__codexBuildInfoButtons,defaultId:__codexBuildInfoButtons.length-1,cancelId:__codexBuildInfoButtons.length-1,message:\`Codex Desktop Linux build information\`,detail:codexLinuxBuildInfoDetail(__codexBuildInfoResult.info,__codexBuildInfoPath)});if(__codexBuildInfoCommitUrl&&__codexBuildInfoBoxResponse?.response===__codexBuildInfoButtonIndex++){await ${electronVar}.shell?.openExternal(__codexBuildInfoCommitUrl);return}if(__codexBuildInfoPath&&__codexBuildInfoBoxResponse?.response===__codexBuildInfoButtonIndex++)await ${electronVar}.shell?.openPath?.(__codexBuildInfoPath)}catch{}}`;
+}
+
+function addLinuxBuildInfoRequestHandler(currentSource) {
+  const handler = "\"codex-linux-get-build-info\":async()=>codexLinuxGetBuildInfo(),\"codex-linux-open-build-info-commit\":async()=>codexLinuxOpenBuildInfoCommit(),\"codex-linux-show-build-info\":async()=>{await codexLinuxShowBuildInfo();return{success:!0}},";
+  const nestedHandler = `({${handler}`;
+  let patchedSource = currentSource;
+  let changed = false;
+  if (patchedSource.includes(nestedHandler)) {
+    patchedSource = patchedSource.replace(nestedHandler, "({");
+    changed = true;
+  } else if (patchedSource.includes(handler)) {
+    return { source: patchedSource, changed: false };
+  }
+
+  const handlerKeyIndexes = [
+    patchedSource.indexOf("\"set-global-state\":async"),
+    patchedSource.indexOf("\"get-global-state\":async"),
+  ].filter((index) => index !== -1);
+  if (handlerKeyIndexes.length === 0) {
+    return { source: patchedSource, changed };
+  }
+
+  const keyIndex = Math.min(...handlerKeyIndexes);
+  return {
+    source: `${patchedSource.slice(0, keyIndex)}${handler}${patchedSource.slice(keyIndex)}`,
+    changed: true,
+  };
 }
 
 function findLinuxBuildInfoHelperInsertionIndex(source, classMatch, helpMenuMatch) {
@@ -813,6 +1103,21 @@ function applyLinuxBuildInfoTrayPatch(currentSource) {
 
   let patchedSource = currentSource;
   let changed = false;
+  if (
+    electronVar != null &&
+    patchedSource.includes(`let ${electronVar}=await ${electronVar}.dialog?.showMessageBox`)
+  ) {
+    patchedSource = patchedSource
+      .replace(
+        `let ${electronVar}=await ${electronVar}.dialog?.showMessageBox`,
+        `let __codexBuildInfoBoxResponse=await ${electronVar}.dialog?.showMessageBox`,
+      )
+      .replaceAll(
+        `&&${electronVar}?.response===`,
+        "&&__codexBuildInfoBoxResponse?.response===",
+      );
+    changed = true;
+  }
   const trayMenuRegex = /getNativeTrayMenuItems\(\)\{[^]*?return\[/g;
   const classRegex = /var [A-Za-z_$][\w$]*=class\{[^]*?getNativeTrayMenuItems\(\)\{[^]*?return\[/;
   const helpMenuPattern = /\{role:`help`,id:[A-Za-z_$][\w$]*\.bn\.help,submenu:\[/;
@@ -854,6 +1159,10 @@ function applyLinuxBuildInfoTrayPatch(currentSource) {
       console.warn("WARN: Could not find Help menu insertion point — skipping Linux build info app menu patch");
     }
   }
+
+  const handlerPatch = addLinuxBuildInfoRequestHandler(patchedSource);
+  patchedSource = handlerPatch.source;
+  changed = changed || handlerPatch.changed;
 
   if (!changed || hasHelper) {
     return patchedSource;
@@ -1007,6 +1316,45 @@ function applyBrowserUseNodeReplApprovalPatch(currentSource) {
   return patchedSource;
 }
 
+function applyLinuxBrowserUseRouteLivenessPatch(currentSource) {
+  if (currentSource.includes("codexLinuxResolveLiveBrowserUseRouteWindow")) {
+    return currentSource;
+  }
+
+  const routeWindowPattern =
+    /function ([A-Za-z_$][\w$]*)\(\{ensureWindowState:([A-Za-z_$][\w$]*),windowId:([A-Za-z_$][\w$]*),windows:([A-Za-z_$][\w$]*)\}\)\{let ([A-Za-z_$][\w$]*)=\4\.get\(\3\)\?\?null;if\(\5==null\)\{let ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.BrowserWindow\.fromId\(\3\);\6!=null&&!\6\.isDestroyed\(\)&&!\6\.webContents\.isDestroyed\(\)&&\(\5=\2\(\6,\6\.webContents\)\)\}return \5==null\|\|\5\.window\.isDestroyed\(\)\|\|\5\.owner\.isDestroyed\(\)\?\(([A-Za-z_$][\w$]*)\(\)\.warning\(`IAB_LIFECYCLE route window is not live`,\{safe:\{hasWindowState:\5!=null,ownerDestroyed:\5\?\.owner\.isDestroyed\(\)\?\?null,windowDestroyed:\5\?\.window\.isDestroyed\(\)\?\?null,windowId:\3\},sensitive:\{\}\}\),null\):\5\}/u;
+
+  const match = currentSource.match(routeWindowPattern);
+  if (match == null) {
+    if (
+      currentSource.includes("IAB_LIFECYCLE route window is not live") &&
+      currentSource.includes("BrowserWindow.fromId")
+    ) {
+      console.warn(
+        "WARN: Could not find Browser Use route liveness helper — skipping Linux route liveness fallback patch",
+      );
+    }
+    return currentSource;
+  }
+
+  const [
+    original,
+    functionName,
+    ensureWindowStateVar,
+    windowIdVar,
+    windowsVar,
+    stateVar,
+    browserWindowVar,
+    electronVar,
+    loggerVar,
+  ] = match;
+
+  const helper = `function codexLinuxResolveLiveBrowserUseRouteWindow(e,t,n,r){if(process.platform!==\`linux\`)return null;let i=[];try{for(let e of n.values())e!=null&&!e.window.isDestroyed()&&!e.owner.isDestroyed()&&i.push(e)}catch{}if(i.length===1)return i[0];let a=[];try{a=r.BrowserWindow.getAllWindows().filter(e=>e!=null&&!e.isDestroyed()&&!e.webContents.isDestroyed())}catch{return null}if(a.length!==1)return null;let o=a[0],s=n.get(o.id)??null;return s!=null&&!s.window.isDestroyed()&&!s.owner.isDestroyed()?s:e(o,o.webContents)}`;
+  const replacement = `${helper}function ${functionName}({ensureWindowState:${ensureWindowStateVar},windowId:${windowIdVar},windows:${windowsVar}}){let ${stateVar}=${windowsVar}.get(${windowIdVar})??null;if(${stateVar}==null){let ${browserWindowVar}=${electronVar}.BrowserWindow.fromId(${windowIdVar});${browserWindowVar}!=null&&!${browserWindowVar}.isDestroyed()&&!${browserWindowVar}.webContents.isDestroyed()&&(${stateVar}=${ensureWindowStateVar}(${browserWindowVar},${browserWindowVar}.webContents))}${stateVar}==null&&(${stateVar}=codexLinuxResolveLiveBrowserUseRouteWindow(${ensureWindowStateVar},${windowIdVar},${windowsVar},${electronVar}));return ${stateVar}==null||${stateVar}.window.isDestroyed()||${stateVar}.owner.isDestroyed()?(${loggerVar}().warning(\`IAB_LIFECYCLE route window is not live\`,{safe:{hasWindowState:${stateVar}!=null,ownerDestroyed:${stateVar}?.owner.isDestroyed()??null,windowDestroyed:${stateVar}?.window.isDestroyed()??null,windowId:${windowIdVar}},sensitive:{}}),null):${stateVar}}`;
+
+  return currentSource.replace(original, replacement);
+}
+
 function applyLinuxChromeExtensionStatusPatch(currentSource) {
   if (currentSource.includes("codexLinuxChromeProfileRoots")) {
     return currentSource;
@@ -1157,6 +1505,8 @@ function applyLinuxRemoteControlConfigPreservationPatch(currentSource) {
 
 module.exports = {
   applyBrowserUseNodeReplApprovalPatch,
+  applyLinuxBrowserUseRouteLivenessPatch,
+  applyLinuxAboutDialogPatch,
   applyLinuxChromeExtensionStatusPatch,
   applyLinuxExplicitIpcQuitPatch,
   applyLinuxExplicitQuitPromptBypassPatch,
@@ -1169,6 +1519,7 @@ module.exports = {
   applyLinuxOpaqueBackgroundPatch,
   applyLinuxQuitGuardPatch,
   applyLinuxReadyToShowWindowStatePatch,
+  applyLinuxResizeRepaintPatch,
   applyLinuxRemoteControlConfigPreservationPatch,
   applyLinuxSetIconPatch,
   applyLinuxSingleInstancePatch,

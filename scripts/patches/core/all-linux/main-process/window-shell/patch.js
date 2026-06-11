@@ -1,11 +1,13 @@
 "use strict";
 
 const {
+  applyLinuxAboutDialogPatch,
   applyLinuxWindowOptionsPatch,
   applyLinuxNativeTitlebarPatch,
   applyLinuxMenuPatch,
   applyLinuxSetIconPatch,
   applyLinuxReadyToShowWindowStatePatch,
+  applyLinuxResizeRepaintPatch,
   applyLinuxOpaqueBackgroundPatch,
   applyLinuxFileManagerPatch,
   applyLinuxBuildInfoTrayPatch,
@@ -16,6 +18,13 @@ const {
 const { applyLinuxAvatarOverlayMousePassthroughPatch } = require("../../../../avatar-overlay.js");
 
 module.exports = [
+  {
+    id: "linux-about-dialog",
+    phase: "main-bundle",
+    order: 55,
+    ciPolicy: "optional",
+    apply: (source, context) => applyLinuxAboutDialogPatch(source, context.iconPathExpression),
+  },
   {
     id: "linux-window-options",
     phase: "main-bundle",
@@ -50,6 +59,13 @@ module.exports = [
     order: 75,
     ciPolicy: "optional",
     apply: applyLinuxReadyToShowWindowStatePatch,
+  },
+  {
+    id: "linux-resize-repaint",
+    phase: "main-bundle",
+    order: 78,
+    ciPolicy: "optional",
+    apply: applyLinuxResizeRepaintPatch,
   },
   {
     id: "linux-opaque-background",

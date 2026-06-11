@@ -3,10 +3,16 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+const {
+  findMatchingBrace,
+} = require("./shared.js");
+
 // Webview asset patches target hashed browser chunks copied out of app.asar.
 // They stay fail-soft because upstream chunk names and minified symbols drift.
 const LINUX_SAFE_MONOSPACE_FONT_STACK =
   "\"Noto Sans Mono\", \"DejaVu Sans Mono\", \"Liberation Mono\", \"Ubuntu Mono\", ui-monospace, \"SFMono-Regular\", \"SF Mono\", Menlo, Consolas, monospace";
+const LINUX_TOOLTIP_COLLISION_PADDING_TOP = 44;
+const LINUX_WINDOW_CONTROLS_SAFE_AREA_RIGHT = 138;
 
 function applyLinuxSafeMonospaceFontStackPatch(currentSource) {
   const safeLinuxMonoFontPattern =
@@ -192,6 +198,114 @@ function applyLinuxOpaqueWindowsDefaultPatch(currentSource) {
   return patchedSource;
 }
 
+function applyLinuxWindowControlsSafeAreaPatch(currentSource) {
+  const currentInset = `applicationMenu:Object.freeze({left:0,right:${LINUX_WINDOW_CONTROLS_SAFE_AREA_RIGHT}})`;
+  const defaultInset = "applicationMenu:Object.freeze({left:0,right:0})";
+  if (currentSource.includes(defaultInset)) {
+    return currentSource.split(defaultInset).join(currentInset);
+  }
+
+  if (currentSource.includes(currentInset)) {
+    return currentSource;
+  }
+
+  if (currentSource.includes("applicationMenu:Object.freeze({left:0,right:")) {
+    console.warn(
+      "WARN: Could not find Linux window controls safe-area insertion point — skipping safe-area patch",
+    );
+  }
+
+  return currentSource;
+}
+
+function applyLinuxTooltipWindowControlsCollisionPatch(currentSource) {
+  const currentPadding = `padding:{top:${LINUX_TOOLTIP_COLLISION_PADDING_TOP},right:8,bottom:8,left:8}`;
+  const defaultMiddleware = "middleware:[a({mainAxis:C,crossAxis:t}),c({padding:8}),l({padding:8}),u({padding:8,apply({availableWidth:e,availableHeight:t,elements:n,rects:r})";
+  const patchedMiddleware =
+    `middleware:[a({mainAxis:C,crossAxis:t}),c({${currentPadding}}),l({${currentPadding}}),u({${currentPadding},apply({availableWidth:e,availableHeight:t,elements:n,rects:r})`;
+
+  let patchedSource = currentSource;
+  if (patchedSource.includes(defaultMiddleware)) {
+    patchedSource = patchedSource.split(defaultMiddleware).join(patchedMiddleware);
+  }
+
+  const middlewarePattern =
+    /middleware:\[([A-Za-z_$][\w$]*)\(\{mainAxis:([^{}]*?),crossAxis:([^{}]*?)\}\),([A-Za-z_$][\w$]*)\(\{padding:8\}\),([A-Za-z_$][\w$]*)\(\{padding:8\}\),([A-Za-z_$][\w$]*)\(\{padding:8,apply\(\{availableWidth:([A-Za-z_$][\w$]*),availableHeight:([A-Za-z_$][\w$]*),elements:([A-Za-z_$][\w$]*),rects:([A-Za-z_$][\w$]*)\}\)/g;
+  patchedSource = patchedSource.replace(
+    middlewarePattern,
+    (_match, offsetAlias, mainAxis, crossAxis, shiftAlias, flipAlias, sizeAlias, availableWidth, availableHeight, elements, rects) =>
+      `middleware:[${offsetAlias}({mainAxis:${mainAxis},crossAxis:${crossAxis}}),${shiftAlias}({${currentPadding}}),${flipAlias}({${currentPadding}}),${sizeAlias}({${currentPadding},apply({availableWidth:${availableWidth},availableHeight:${availableHeight},elements:${elements},rects:${rects}})`,
+  );
+
+  if (patchedSource !== currentSource || patchedSource.includes(currentPadding)) {
+    return patchedSource;
+  }
+
+  if (currentSource.includes("middleware:[") && currentSource.includes("availableWidth")) {
+    console.warn(
+      "WARN: Could not find tooltip collision padding insertion point — skipping Linux tooltip titlebar collision patch",
+    );
+  }
+
+  return currentSource;
+}
+
+function findLocalEnvironmentActionModalFunction(currentSource) {
+  const componentPattern =
+    /function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\)\{let ([A-Za-z_$][\w$]*)=\(0,([A-Za-z_$][\w$]*)\.c\)\(\d+\),\{action:([A-Za-z_$][\w$]*),[^{}]*onUpdate:([A-Za-z_$][\w$]*),workspaceRoot:([A-Za-z_$][\w$]*)\}=\2,/g;
+  let match;
+  while ((match = componentPattern.exec(currentSource)) != null) {
+    const openBrace = currentSource.indexOf("{", match.index);
+    const closeBrace = findMatchingBrace(currentSource, openBrace);
+    if (closeBrace === -1) {
+      continue;
+    }
+    const text = currentSource.slice(match.index, closeBrace + 1);
+    if (
+      text.includes("settings.localEnvironments.actions.add.description") &&
+      text.includes("threadPage.runAction.setup.commandLabel") &&
+      text.includes(`local-env-action-name-\${${match[5]}.id}`)
+    ) {
+      return {
+        start: match.index,
+        end: closeBrace + 1,
+        text,
+        paramVar: match[2],
+        cacheVar: match[3],
+        actionVar: match[5],
+        updateVar: match[6],
+        workspaceVar: match[7],
+      };
+    }
+  }
+  return null;
+}
+
+function applyLinuxThreadSidePanelNativeTooltipPatch(currentSource) {
+  const nativeTitleNeedle = 'disabled:l,title:i,onClick:a,uniform:!0';
+  const nativeTitlePatch = 'disabled:l,onClick:a,uniform:!0';
+
+  if (!currentSource.includes("id:`thread.sidePanel.toggle`")) {
+    return currentSource;
+  }
+
+  if (currentSource.includes(nativeTitlePatch) && !currentSource.includes(nativeTitleNeedle)) {
+    return currentSource;
+  }
+
+  if (currentSource.includes(nativeTitleNeedle)) {
+    return currentSource.split(nativeTitleNeedle).join(nativeTitlePatch);
+  }
+
+  if (currentSource.includes("tooltipContent:i") && currentSource.includes("title:i")) {
+    console.warn(
+      "WARN: Could not find thread side panel native tooltip insertion point — skipping Linux duplicate side panel tooltip patch",
+    );
+  }
+
+  return currentSource;
+}
+
 function applyLinuxAppSunsetPatch(currentSource) {
   const statsigKey = "2929582856";
   const disabledGatePattern = /if\(!1&&([A-Za-z_$][\w$]*)\(`2929582856`\)\)\{/u;
@@ -293,6 +407,54 @@ function applyLinuxBrowserUseNonLocalNavigationPatch(currentSource) {
   return currentSource;
 }
 
+function applyLinuxBrowserUseExternalAvailabilityPatch(currentSource) {
+  const externalFeatureNeedle = "featureName:`browser_use_external`";
+  const statsigNeedle = "410065390";
+  let changed = false;
+
+  const alreadyPatched = () =>
+    /featureName:`browser_use_external`[\s\S]{0,900}?navigator\.userAgent\.includes\(`Linux`\)/.test(currentSource);
+
+  const availabilityPattern =
+    /let ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\),([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)===`chrome-extension`\|\|([A-Za-z_$][\w$]*)&&\1\.enabled&&!\1\.isLoading,([A-Za-z_$][\w$]*)=\5===`chrome-extension`\?!1:\1\.isLoading,/g;
+
+  const patchedSource = currentSource.replace(
+    availabilityPattern,
+    (
+      match,
+      featureQueryVar,
+      featureQueryFn,
+      featureQueryArg,
+      availableVar,
+      windowTypeVar,
+      statsigVar,
+      loadingVar,
+      offset,
+    ) => {
+      const contextStart = Math.max(0, offset - 700);
+      const context = currentSource.slice(contextStart, offset + match.length);
+      if (!context.includes(externalFeatureNeedle) || !context.includes(statsigNeedle)) {
+        return match;
+      }
+
+      changed = true;
+      return `let ${featureQueryVar}=${featureQueryFn}(${featureQueryArg}),${availableVar}=${windowTypeVar}===\`chrome-extension\`||navigator.userAgent.includes(\`Linux\`)||${statsigVar}&&${featureQueryVar}.enabled&&!${featureQueryVar}.isLoading,${loadingVar}=${windowTypeVar}===\`chrome-extension\`||navigator.userAgent.includes(\`Linux\`)?!1:${featureQueryVar}.isLoading,`;
+    },
+  );
+
+  if (changed || alreadyPatched()) {
+    return patchedSource;
+  }
+
+  if (currentSource.includes(externalFeatureNeedle) && currentSource.includes(statsigNeedle)) {
+    console.warn(
+      "WARN: Could not find Browser Use external availability gate — skipping Linux external Browser Use availability patch",
+    );
+  }
+
+  return currentSource;
+}
+
 function applyLinuxAppServerFeatureEnablementPatch(currentSource) {
   const supportedFeatures = new Set([
     "apps",
@@ -377,6 +539,10 @@ function applyLinuxAppServerFeatureEnablementPatch(currentSource) {
 }
 
 function applyLinuxI18nGatePatch(currentSource) {
+  const alreadyPatchedI18nGateRegexes = [
+    /([A-Za-z_$][\w$]*)=[^;]*?\.get\(`enable_i18n`,!1\)[^;]*;let [^;]*,([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*\.localeOverride\),[A-Za-z_$][\w$]*=\1\|\|\2!=null/u,
+    /([A-Za-z_$][\w$]*)=[^;]*?\.get\(`enable_i18n`,!0\)[^;]*,([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*\.localeOverride\);\1=\1\|\|\2!=null;/u,
+  ];
   let patchedSource = currentSource.replace(
     /([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*\?\.get\(`enable_i18n`,!1\)(?:,[^;]+?)?);let ([A-Za-z_$][\w$]*)=\1,([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*\?\.get\(`locale_source`,`IDE`\)),([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\.localeOverride\)/g,
     (
@@ -428,7 +594,11 @@ function applyLinuxI18nGatePatch(currentSource) {
     },
   );
 
-  if (currentSource.includes("enable_i18n") && patchedSource === currentSource) {
+  if (
+    currentSource.includes("enable_i18n") &&
+    patchedSource === currentSource &&
+    !alreadyPatchedI18nGateRegexes.some((regex) => regex.test(currentSource))
+  ) {
     console.warn("WARN: Could not find i18n gate needle — skipping Linux i18n gate patch");
   }
 
@@ -480,15 +650,16 @@ function applyLinuxConfigWriteVersionConflictPatch(currentSource) {
 
 function applySubagentNicknameMetadataPatch(currentSource) {
   let patchedSource = currentSource;
-  const sourceShapePatchedMarker = "`subAgent`in e?e.subAgent:`subagent`in e?e.subagent:null";
-  const nicknamePatchedMarker =
-    "Zl(e.agentNickname)??Zl(e.agent_nickname)??Zl(B(e.source)?.agentNickname)";
+  const sourceShapePatchedRegex =
+    /`subAgent`in ([A-Za-z_$][\w$]*)\?\1\.subAgent:`subagent`in \1\?\1\.subagent:null/u;
+  const nicknamePatchedRegex =
+    /([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\.agentNickname\)\?\?\1\(\2\.agent_nickname\)\?\?\1\([A-Za-z_$][\w$]*\(\2\.source\)\?\.agentNickname\)/u;
 
   const sourceShapeNeedle =
     "function Mi(e){return`subAgent`in e?e.subAgent:null}function Ni(e){return typeof e==`string`?Pi():`thread_spawn`in e?{parentThreadId:j(e.thread_spawn.parent_thread_id),depth:e.thread_spawn.depth,agentNickname:e.thread_spawn.agent_nickname,agentRole:e.thread_spawn.agent_role}:Pi()}";
   const sourceShapePatch =
     "function Mi(e){return`subAgent`in e?e.subAgent:`subagent`in e?e.subagent:null}function Ni(e){return typeof e==`string`?Pi():`thread_spawn`in e?{parentThreadId:j(e.thread_spawn.parent_thread_id),depth:e.thread_spawn.depth,agentNickname:e.thread_spawn.agent_nickname,agentRole:e.thread_spawn.agent_role}:Pi()}";
-  if (patchedSource.includes(sourceShapePatchedMarker)) {
+  if (sourceShapePatchedRegex.test(patchedSource)) {
     // Already patched.
   } else if (patchedSource.includes(sourceShapeNeedle)) {
     patchedSource = patchedSource.replace(sourceShapeNeedle, sourceShapePatch);
@@ -507,7 +678,7 @@ function applySubagentNicknameMetadataPatch(currentSource) {
     "function Xl(e){return e==null?null:Zl(e.agentNickname)??Zl(B(e.source)?.agentNickname)}";
   const nicknamePatch =
     "function Xl(e){return e==null?null:Zl(e.agentNickname)??Zl(e.agent_nickname)??Zl(B(e.source)?.agentNickname)}";
-  if (patchedSource.includes(nicknamePatchedMarker)) {
+  if (nicknamePatchedRegex.test(patchedSource)) {
     // Already patched.
   } else if (patchedSource.includes(nicknameNeedle)) {
     patchedSource = patchedSource.replace(nicknameNeedle, nicknamePatch);
@@ -524,7 +695,7 @@ function applySubagentNicknameMetadataPatch(currentSource) {
 
   if (
     patchedSource === currentSource &&
-    !(currentSource.includes(sourceShapePatchedMarker) && currentSource.includes(nicknamePatchedMarker)) &&
+    !(sourceShapePatchedRegex.test(currentSource) && nicknamePatchedRegex.test(currentSource)) &&
     (currentSource.includes("agentNickname") ||
       currentSource.includes("agent_nickname") ||
       currentSource.includes("thread_spawn"))
@@ -548,28 +719,23 @@ function applyLocalEnvironmentActionModalDraftPatch(currentSource) {
     return currentSource;
   }
 
-  const functionStart = currentSource.indexOf("function gd(e){");
-  if (functionStart === -1) {
+  const modalFunction = findLocalEnvironmentActionModalFunction(currentSource);
+  if (modalFunction == null) {
     console.warn(
       "WARN: Could not find local environment action modal component — skipping action input patch",
     );
     return currentSource;
   }
 
-  const functionEnd = currentSource.indexOf("var _d=", functionStart);
-  if (functionEnd === -1) {
-    console.warn(
-      "WARN: Could not find local environment action modal component boundary — skipping action input patch",
-    );
-    return currentSource;
-  }
-
-  const beforeFunction = currentSource.slice(0, functionStart);
-  const afterFunction = currentSource.slice(functionEnd);
-  let patchedFunction = currentSource.slice(functionStart, functionEnd);
-  const stateNeedle = "workspaceRoot:u}=e,d=Gt()";
+  const beforeFunction = currentSource.slice(0, modalFunction.start);
+  const afterFunction = currentSource.slice(modalFunction.end);
+  let patchedFunction = modalFunction.text;
+  const reactVar =
+    currentSource.match(/\(0,([A-Za-z_$][\w$]*)\.useState\)\(/)?.[1] ?? "Q";
+  const { actionVar, cacheVar, paramVar, updateVar, workspaceVar } = modalFunction;
+  const stateNeedle = `workspaceRoot:${workspaceVar}}=${paramVar},`;
   const statePatch =
-    "workspaceRoot:u}=e,[codexLinuxActionDraft,codexLinuxSetActionDraft]=(0,Q.useState)(()=>n),codexLinuxUpdateActionDraft=e=>(codexLinuxSetActionDraft(t=>({...t,...e})),l(e)),d=Gt()";
+    `workspaceRoot:${workspaceVar}}=${paramVar},[codexLinuxActionDraft,codexLinuxSetActionDraft]=(0,${reactVar}.useState)(()=>${actionVar}),codexLinuxUpdateActionDraft=codexLinuxPatch=>(codexLinuxSetActionDraft(codexLinuxDraft=>({...codexLinuxDraft,...codexLinuxPatch})),${updateVar}(codexLinuxPatch)),`;
   const requiredReplacements = [
     {
       needle: stateNeedle,
@@ -577,46 +743,55 @@ function applyLocalEnvironmentActionModalDraftPatch(currentSource) {
       description: "draft state insertion point",
     },
     {
-      needle: "if(t[0]!==n||",
-      replacement: "if(t[0]!==codexLinuxActionDraft||t[0]!==n||",
+      needle: `if(${cacheVar}[0]!==${actionVar}||`,
+      replacement: `if(${cacheVar}[0]!==codexLinuxActionDraft||${cacheVar}[0]!==${actionVar}||`,
       description: "modal memo guard",
     },
     {
-      needle: "{...n,command:I,name:P}",
-      replacement: "{...codexLinuxActionDraft,command:I,name:P}",
-      description: "saved action payload",
-    },
-    {
-      needle: "n.icon",
+      needle: `${actionVar}.icon`,
       replacement: "codexLinuxActionDraft.icon",
       description: "icon draft references",
     },
     {
-      needle: "n.name",
+      needle: `${actionVar}.name`,
       replacement: "codexLinuxActionDraft.name",
       description: "name draft references",
     },
     {
-      needle: "n.command",
+      needle: `${actionVar}.command`,
       replacement: "codexLinuxActionDraft.command",
       description: "command draft references",
     },
     {
-      needle: "l({icon:e.value})",
+      needle: `${updateVar}({icon:e.value})`,
       replacement: "codexLinuxUpdateActionDraft({icon:e.value})",
       description: "icon update callback",
     },
     {
-      needle: "l({name:e.target.value})",
+      needle: `${updateVar}({name:e.target.value})`,
       replacement: "codexLinuxUpdateActionDraft({name:e.target.value})",
       description: "name update callback",
     },
     {
-      needle: "l({command:e})",
+      needle: `${updateVar}({command:e})`,
       replacement: "codexLinuxUpdateActionDraft({command:e})",
       description: "command update callback",
     },
   ];
+
+  const savedPayloadPattern = new RegExp(
+    String.raw`\{\.\.\.${actionVar},command:([A-Za-z_$][\w$]*),name:([A-Za-z_$][\w$]*)\}`,
+  );
+  if (!savedPayloadPattern.test(patchedFunction)) {
+    console.warn(
+      "WARN: Could not find local environment action modal saved action payload — skipping action input patch",
+    );
+    return currentSource;
+  }
+  patchedFunction = patchedFunction.replace(
+    savedPayloadPattern,
+    "{...codexLinuxActionDraft,command:$1,name:$2}",
+  );
 
   const missingReplacement = requiredReplacements.find(
     ({ needle }) => !patchedFunction.includes(needle),
@@ -1123,6 +1298,7 @@ module.exports = {
   applyBrowserAnnotationScreenshotPatch,
   applyLinuxAppServerFeatureEnablementPatch,
   applyLinuxBrowserUseAvailabilityPatch,
+  applyLinuxBrowserUseExternalAvailabilityPatch,
   applyLinuxBrowserUseNonLocalNavigationPatch,
   applyLinuxConfigWriteVersionConflictPatch,
   applyLinuxI18nGatePatch,
@@ -1130,6 +1306,9 @@ module.exports = {
   applyPersistentRateLimitFooterPatch,
   applyLinuxAppSunsetPatch,
   applyLinuxOpaqueWindowsDefaultPatch,
+  applyLinuxThreadSidePanelNativeTooltipPatch,
+  applyLinuxTooltipWindowControlsCollisionPatch,
+  applyLinuxWindowControlsSafeAreaPatch,
   applyLinuxSafeMonospaceFontStackPatch,
   applyLinuxFastModeModelGuardPatch,
   applyLocalEnvironmentActionModalDraftPatch,
