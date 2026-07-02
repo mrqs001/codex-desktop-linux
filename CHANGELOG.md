@@ -5,6 +5,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-06-20
+
 ### Added
 
 - The `make setup-native` Linux feature picker can now present a GUI checklist
@@ -53,9 +55,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   bundled plugin registry so the app keeps `read-aloud` installed, and the
   launcher syncs the plugin cache so new Codex windows expose the MCP tools
   through the same auto-install path as Computer Use.
+- The Home Manager and NixOS modules gained a
+  `programs.codexDesktopLinux.cliPackage` option that wraps the installed Codex
+  Desktop launcher (and its `.desktop` entry) so it always starts with
+  `CODEX_CLI_PATH` pointing at the chosen CLI. Because the path is baked into the
+  launcher instead of exported as a session variable, Codex Desktop reliably
+  finds the Codex CLI regardless of how it is launched (graphical autostart,
+  application launcher, terminal, or warm-start handoff), even when the Nix
+  profile is not on the graphical session `PATH`, and the change takes effect on
+  the next app launch with no re-login. When unset it falls back to
+  `remoteControl.package` if the remote-control service is enabled. This avoids
+  the `Unable to locate the Codex CLI binary. Set CODEX_CLI_PATH ...` startup
+  failure.
 
 ### Fixed
 
+- `codex-update-manager` no longer depends on the `fs4` crate for updater check
+  serialization. The updater now uses `std::fs::File::try_lock`, preserves the
+  existing non-blocking `check.lock` behavior when another check is active, and
+  adds regression coverage for `WouldBlock` lock contention semantics.
+- The avatar overlay is focusable on Linux so inline pet reply inputs can accept
+  keyboard input after being clicked, while still staying above the main Codex
+  window as an overlay.
+- Plugin marketplace browsing now preserves upstream's `remote_plugin`
+  feature sync on Linux, so current app servers can load the remote OpenAI
+  curated catalog instead of falling back to only locally installed plugins.
+- The opt-in `remote-mobile-control` cold-start hook no longer removes
+  `~/.local/bin/codex` when the launcher is actively using that symlink as
+  `CODEX_CLI_PATH`.
 - The in-app updater no longer quits into a broken `pkexec` install path when a
   minimal window-manager session has no graphical polkit authentication agent;
   it keeps the rebuilt package ready and reports a terminal `sudo

@@ -447,7 +447,7 @@ install_node_repl_from_primary_runtime_archive() {
 }
 
 install_browser_use_node_repl_resource() {
-    local upstream_source="$1"
+    local upstream_resources="$1"
     local destination="$2"
     local source
 
@@ -466,9 +466,15 @@ install_browser_use_node_repl_resource() {
         return 0
     fi
 
-    if [ -n "$upstream_source" ] && install_browser_use_node_repl_executable_resource "$upstream_source" "$destination" "node_repl runtime" "info"; then
-        return 0
-    fi
+    for source in \
+        "$upstream_resources/cua_node/bin/node_repl" \
+        "$upstream_resources/node_repl"
+    do
+        [ -f "$source" ] || continue
+        if install_browser_use_node_repl_executable_resource "$source" "$destination" "node_repl runtime" "info"; then
+            return 0
+        fi
+    done
 
     install_node_repl_from_primary_runtime_archive "$destination"
 }
@@ -553,6 +559,20 @@ patch_chrome_plugin_for_linux() {
     fi
 }
 
+normalize_plugin_script_executable_modes() {
+    local target_plugin="$1"
+    local scripts_dir="$target_plugin/scripts"
+    local script
+
+    [ -d "$scripts_dir" ] || return 0
+
+    while IFS= read -r -d '' script; do
+        if [ "$(head -c 2 "$script" 2>/dev/null || true)" = "#!" ]; then
+            chmod 0755 "$script"
+        fi
+    done < <(find "$scripts_dir" -maxdepth 1 -type f -name '*.js' -print0)
+}
+
 stage_chrome_plugin_from_upstream() {
     local source_plugin="$1"
     local target_plugins="$2"
@@ -581,8 +601,10 @@ stage_chrome_plugin_from_upstream() {
     remove_macos_sidecar_files "$target_plugin"
     patch_chrome_plugin_for_linux "$target_plugin"
     patch_browser_use_node_repl_env_guard "$target_plugin/scripts/browser-client.mjs"
+    patch_browser_use_node_repl_config_shim "$target_plugin/scripts/browser-client.mjs"
     patch_browser_use_native_pipe_import_meta_bridge "$target_plugin/scripts/browser-client.mjs"
     patch_browser_use_site_status_allowlist_fallback "$target_plugin/scripts/browser-client.mjs"
+    normalize_plugin_script_executable_modes "$target_plugin"
     if ! install_chrome_extension_host_resource "$target_plugin"; then
         rm -rf "$target_plugin"
         return 1
@@ -606,18 +628,36 @@ import sys
 
 path = Path(sys.argv[1])
 source = path.read_text(encoding="utf-8")
-pattern = re.compile(
-    r'async fetchBlocked\((?P<url>[A-Za-z_$][\w$]*)\)\{'
-    r'let (?P<response>[A-Za-z_$][\w$]*)=await (?P<fetch>[A-Za-z_$][\w$]*)'
-    r'\((?P=url)\.endpoint,\{method:"GET"\}\);'
-    r'if\(!(?P=response)\.ok\)throw new Error\((?P<format>[A-Za-z_$][\w$]*)'
-    r'\(`Browser Use cannot determine if \$\{(?P=url)\.displayUrl\} is allowed\. '
-    r'Please try again later or use another source\.`\)\);'
-    r'let (?P<json>[A-Za-z_$][\w$]*)=await (?P=response)\.json\(\);'
-    r'return (?P<status>[A-Za-z_$][\w$]*)\((?P=json)\)\}'
-)
-match = pattern.search(source)
+patterns = [
+    re.compile(
+        r'async fetchBlocked\((?P<url>[A-Za-z_$][\w$]*)\)\{'
+        r'let (?P<response>[A-Za-z_$][\w$]*)=await (?P<fetch>[A-Za-z_$][\w$]*)'
+        r'\((?P=url)\.endpoint,\{method:"GET"\}\);'
+        r'if\(!(?P=response)\.ok\)throw new Error\((?P<format>[A-Za-z_$][\w$]*)'
+        r'\(`Browser Use cannot determine if \$\{(?P=url)\.displayUrl\} is allowed\. '
+        r'Please try again later or use another source\.`\)\);'
+        r'let (?P<json>[A-Za-z_$][\w$]*)=await (?P=response)\.json\(\);'
+        r'return (?P<status>[A-Za-z_$][\w$]*)\((?P=json)\)\}'
+    ),
+    re.compile(
+        r'async fetchBlocked\((?P<url>[A-Za-z_$][\w$]*),(?P<label>[A-Za-z_$][\w$]*)\)\{'
+        r'let (?P<response>[A-Za-z_$][\w$]*)=await (?P<fetch>[A-Za-z_$][\w$]*)'
+        r'\((?P=url)\.endpoint,\{method:"GET"\}\);'
+        r'if\(!(?P=response)\.ok\)throw new Error\((?P<format>[A-Za-z_$][\w$]*)'
+        r'\(`\$\{(?P=label)\} cannot determine if \$\{(?P=url)\.displayUrl\} is allowed\. '
+        r'Please try again later or use another source\.`\)\);'
+        r'let (?P<json>[A-Za-z_$][\w$]*)=await (?P=response)\.json\(\);'
+        r'return (?P<status>[A-Za-z_$][\w$]*)\((?P=json)\)\}'
+    ),
+]
+match = None
+for pattern in patterns:
+    match = pattern.search(source)
+    if match is not None:
+        break
 if match is None:
+    if "/aura/site_status" not in source and "fetchBlocked(" not in source:
+        raise SystemExit(0)
     print(
         "WARN: Could not find Browser Use site_status allowlist fallback insertion point — leaving browser-client.mjs unchanged",
         file=sys.stderr,
@@ -630,14 +670,21 @@ fetch = match.group("fetch")
 formatter = match.group("format")
 json_value = match.group("json")
 status = match.group("status")
+label = match.groupdict().get("label")
 error = "__codexLinuxErr"
+error_message = (
+    f'Browser Use cannot determine if ${{{url}.displayUrl}} is allowed. Please try again later or use another source.'
+    if label is None
+    else f'${{{label}}} cannot determine if ${{{url}.displayUrl}} is allowed. Please try again later or use another source.'
+)
+args = url if label is None else f"{url},{label}"
 replacement = (
-    f'async fetchBlocked({url}){{let {response};try{{{response}=await {fetch}({url}.endpoint,{{method:"GET"}})}}'
+    f'async fetchBlocked({args}){{let {response};try{{{response}=await {fetch}({url}.endpoint,{{method:"GET"}})}}'
     f'catch({error}){{if(String({url}?.endpoint??"").includes("/aura/site_status")&&'
     f'String({error}?.message??{error}).toLowerCase().includes("allowlist"))return console.warn'
     f'("codexLinuxSiteStatusAllowlistFallback",{url}.endpoint),!1;throw {error}}}'
-    f'if(!{response}.ok)throw new Error({formatter}(`Browser Use cannot determine if ${{{url}.displayUrl}} is allowed. '
-    f'Please try again later or use another source.`));let {json_value}=await {response}.json();return {status}({json_value})}}'
+    f'if(!{response}.ok)throw new Error({formatter}(`{error_message}`));'
+    f'let {json_value}=await {response}.json();return {status}({json_value})}}'
 )
 path.write_text(source[:match.start()] + replacement + source[match.end():], encoding="utf-8")
 PY
@@ -745,6 +792,172 @@ replacement = (
     f'function {helper}({key}){{'
     f'let {value}=globalThis.nodeRepl?.env?.[{key}];'
     f'return typeof {value}=="string"?{value}:void 0}}'
+)
+path.write_text(source[:match.start()] + replacement + source[match.end():], encoding="utf-8")
+PY
+}
+
+patch_browser_use_node_repl_config_shim() {
+    local client="$1"
+
+    if grep -q "codexLinuxBrowserUseConfigShim" "$client"; then
+        return 0
+    fi
+
+    python3 - "$client" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+pattern = re.compile(
+    r'function (?P<helper>[A-Za-z_$][\w$]*)\(\)\{'
+    r'let (?P<value>[A-Za-z_$][\w$]*)=globalThis\.nodeRepl;'
+    r'return (?P=value)\?\.config==null\?void 0:(?P=value)\}'
+)
+match = pattern.search(source)
+if match is None:
+    print(
+        "WARN: Could not find Browser Use nodeRepl config shim insertion point — leaving browser-client.mjs unchanged",
+        file=sys.stderr,
+    )
+    raise SystemExit(0)
+
+helper = match.group("helper")
+value = match.group("value")
+shim = r'''
+function codexLinuxBrowserUseConfigShim() {
+  let repl = globalThis.nodeRepl;
+  if (repl == null || repl.config != null) return;
+  let config = {
+    read: async () => ({ config: await codexLinuxBrowserUseReadToml("config.toml") }),
+    readRequirements: async () => ({ requirements: null }),
+    readToml: async (filePath) => codexLinuxBrowserUseReadToml(filePath),
+    writeToml: codexLinuxBrowserUseIgnoreConfigWrite,
+    writeValue: codexLinuxBrowserUseIgnoreConfigWrite,
+    batchWrite: codexLinuxBrowserUseIgnoreConfigWrite,
+  };
+
+  try {
+    repl.config = config;
+    if (repl.config != null) return;
+  } catch {}
+
+  try {
+    let prototype = Object.getPrototypeOf(repl);
+    if (prototype != null && Object.getOwnPropertyDescriptor(prototype, "config") == null) {
+      Object.defineProperty(prototype, "config", {
+        configurable: true,
+        get: () => config,
+      });
+    }
+  } catch {}
+}
+
+function codexLinuxBrowserUseCodexHome() {
+  let codexHome = globalThis.nodeRepl?.env?.CODEX_HOME;
+  if (typeof codexHome == "string" && codexHome.length > 0) {
+    return codexHome.replace(/\/+$/, "");
+  }
+
+  let homeDir = globalThis.nodeRepl?.homeDir;
+  return typeof homeDir == "string" && homeDir.length > 0
+    ? `${homeDir.replace(/\/+$/, "")}/.codex`
+    : null;
+}
+
+function codexLinuxBrowserUseConfigPath(filePath) {
+  let codexHome = codexLinuxBrowserUseCodexHome();
+  if (codexHome == null || typeof filePath != "string" || filePath.length === 0) {
+    return null;
+  }
+
+  let normalized = filePath.replaceAll("\\", "/");
+  if (normalized.startsWith("/")) {
+    return normalized === codexHome || normalized.startsWith(`${codexHome}/`)
+      ? normalized
+      : null;
+  }
+
+  normalized = normalized.replace(/^\/+/, "");
+  return normalized.split("/").includes("..") ? null : `${codexHome}/${normalized}`;
+}
+
+async function codexLinuxBrowserUseReadToml(filePath) {
+  let configPath = codexLinuxBrowserUseConfigPath(filePath);
+  if (configPath == null) return {};
+
+  try {
+    let { readFile } = await import("node:fs/promises");
+    return codexLinuxBrowserUseParseToml(await readFile(configPath, "utf8"));
+  } catch (error) {
+    if (error && typeof error == "object" && error.code === "ENOENT") return {};
+    throw error;
+  }
+}
+
+async function codexLinuxBrowserUseIgnoreConfigWrite() {
+  return undefined;
+}
+
+function codexLinuxBrowserUseParseToml(source) {
+  let root = {};
+  let section = root;
+
+  for (let line of String(source).split(/\r?\n/)) {
+    let trimmed = line.trim();
+    if (trimmed.length === 0 || trimmed.startsWith("#")) continue;
+
+    let sectionMatch = trimmed.match(/^\[([A-Za-z0-9_.-]+)\]$/);
+    if (sectionMatch) {
+      section = root;
+      for (let part of sectionMatch[1].split(".")) {
+        section = section[part] && typeof section[part] == "object" && !Array.isArray(section[part])
+          ? section[part]
+          : (section[part] = {});
+      }
+      continue;
+    }
+
+    let separator = trimmed.indexOf("=");
+    if (separator < 0) continue;
+
+    let key = trimmed.slice(0, separator).trim();
+    let value = trimmed.slice(separator + 1).trim();
+    if (key) section[key] = codexLinuxBrowserUseParseTomlValue(value);
+  }
+
+  return root;
+}
+
+function codexLinuxBrowserUseParseTomlValue(value) {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  if (/^-?\d+(?:\.\d+)?$/.test(value)) return Number(value);
+
+  if (value.startsWith("[") && value.endsWith("]")) {
+    let body = value.slice(1, -1).trim();
+    return body.length === 0
+      ? []
+      : body.split(",").map((item) => codexLinuxBrowserUseParseTomlValue(item.trim()));
+  }
+
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value.slice(1, -1);
+    }
+  }
+
+  return value;
+}
+'''
+replacement = (
+    shim
+    + f'function {helper}(){{codexLinuxBrowserUseConfigShim();let {value}=globalThis.nodeRepl;'
+    + f'return {value}?.config==null?void 0:{value}}}'
 )
 path.write_text(source[:match.start()] + replacement + source[match.end():], encoding="utf-8")
 PY
@@ -868,6 +1081,7 @@ stage_browser_plugin_from_upstream() {
     cp -R "$source_plugin" "$target_plugin"
     remove_macos_sidecar_files "$target_plugin"
     patch_browser_use_node_repl_env_guard "$target_client"
+    patch_browser_use_node_repl_config_shim "$target_client"
     patch_browser_use_native_pipe_import_meta_bridge "$target_client"
     patch_browser_use_site_status_allowlist_fallback "$target_client"
     patch_browser_use_file_url_policy "$target_client"
@@ -1072,7 +1286,7 @@ install_bundled_plugin_resources() {
     write_bundled_plugins_marketplace "$source_marketplace" "$bundled_plugins_dir/.agents/plugins/marketplace.json" "$include_browser" "$include_chrome" "$include_computer_use"
 
     install_linux_executable_resource "$upstream_resources/node" "$resources_dir/node" "node runtime" "info" || true
-    install_browser_use_node_repl_resource "$upstream_resources/node_repl" "$resources_dir/node_repl" || true
+    install_browser_use_node_repl_resource "$upstream_resources" "$resources_dir/node_repl" || true
 
     info "Linux-safe bundled plugins installed"
 }

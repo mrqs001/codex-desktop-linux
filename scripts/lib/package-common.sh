@@ -68,16 +68,16 @@ const path = require("node:path");
 
 const helperPath = path.resolve(process.argv[2]);
 const targetPath = path.resolve(process.argv[3]);
-const { enabledLinuxFeatureIds } = require(helperPath);
+const { enabledLinuxFeaturesConfig } = require(helperPath);
 
-const enabled = enabledLinuxFeatureIds();
-if (enabled.length === 0) {
+const config = enabledLinuxFeaturesConfig();
+if (config.enabled.length === 0) {
   fs.rmSync(targetPath, { force: true });
   process.exit(0);
 }
 
 fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-fs.writeFileSync(targetPath, `${JSON.stringify({ enabled }, null, 2)}\n`);
+fs.writeFileSync(targetPath, `${JSON.stringify(config, null, 2)}\n`);
 NODE
 }
 
@@ -734,6 +734,7 @@ stage_update_builder_bundle() {
     cp "$REPO_DIR/Cargo.toml" "$update_builder_root/Cargo.toml"
     cp "$REPO_DIR/Cargo.lock" "$update_builder_root/Cargo.lock"
     cp -r "$REPO_DIR/computer-use-linux" "$update_builder_root/computer-use-linux"
+    cp -r "$REPO_DIR/record-replay-linux" "$update_builder_root/record-replay-linux"
     cp -r "$REPO_DIR/read-aloud-linux" "$update_builder_root/read-aloud-linux"
     cp -r "$REPO_DIR/updater" "$update_builder_root/updater"
     mkdir -p "$update_builder_root/plugins/openai-bundled/plugins"
@@ -784,6 +785,7 @@ stage_update_builder_bundle() {
     stage_update_builder_linux_features_config "$update_builder_root"
     cp "$REPO_DIR/packaging/linux/codex-update-manager.postrm" "$update_builder_root/packaging/linux/codex-update-manager.postrm"
     cp "$REPO_DIR/assets/codex.png" "$update_builder_root/assets/codex.png"
+    cp "$REPO_DIR/assets/codex-linux.png" "$update_builder_root/assets/codex-linux.png"
     stage_update_builder_source_info "$update_builder_root"
     if [ -d "$node_runtime_source" ]; then
         cp -a "$node_runtime_source" "$update_builder_root/node-runtime"
@@ -875,7 +877,7 @@ write_launcher_stub() {
     local root="$1"
 
     cat > "$root/usr/bin/$PACKAGE_NAME" <<SCRIPT
-#!/bin/bash
+#!/usr/bin/env bash
 exec /opt/$PACKAGE_NAME/start.sh "\$@"
 SCRIPT
     chmod 0755 "$root/usr/bin/$PACKAGE_NAME"

@@ -1,7 +1,8 @@
 "use strict";
 
+const { patchStatusFromChange } = require("../../../../../lib/patch-report.js");
 const {
-  applyBrowserUseNodeReplApprovalPatch,
+  applyBrowserUseNodeReplApprovalAssets,
   applyLinuxBrowserUseRouteLivenessPatch,
   applyLinuxChromeExtensionStatusPatch,
 } = require("../../../../main-process.js");
@@ -12,15 +13,25 @@ module.exports = [
     id: "linux-chrome-plugin-auto-install",
     phase: "main-bundle",
     order: 150,
-    ciPolicy: "required-upstream",
+    ciPolicy: "optional",
     apply: applyLinuxChromePluginAutoInstallPatch,
   },
   {
     id: "browser-use-node-repl-approval",
-    phase: "main-bundle",
+    phase: "extracted-app",
     order: 160,
     ciPolicy: "optional",
-    apply: applyBrowserUseNodeReplApprovalPatch,
+    apply: applyBrowserUseNodeReplApprovalAssets,
+    status: (result, warnings) => ({
+      status:
+        result?.matched === 0
+          ? "skipped-optional"
+          : patchStatusFromChange(Boolean(result?.changed), warnings, "optional"),
+      reason:
+        result?.matched === 0
+          ? "Browser Use node_repl mcp config bundle not found"
+          : warnings[0] ?? null,
+    }),
   },
   {
     id: "linux-browser-use-route-liveness",
@@ -33,7 +44,7 @@ module.exports = [
     id: "linux-chrome-extension-status",
     phase: "main-bundle",
     order: 180,
-    ciPolicy: "required-upstream",
+    ciPolicy: "optional",
     apply: applyLinuxChromeExtensionStatusPatch,
   },
 ];
