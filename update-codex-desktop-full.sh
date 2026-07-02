@@ -135,8 +135,7 @@ else
     "remote-control-ui",
     "remote-mobile-control",
     "thorium-chrome-plugin",
-    "x11-ewmh-computer-use",
-    "zed-opener"
+    "x11-ewmh-computer-use"
   ]
 }
 JSON
