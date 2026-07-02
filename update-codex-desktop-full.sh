@@ -234,6 +234,39 @@ run_checks() {
     env -u CODEX_LINUX_FEATURES_CONFIG node --test linux-features/*/test.js
 }
 
+latest_matching_file() {
+    local pattern matches
+    pattern="$1"
+    matches="$(compgen -G "$pattern" || true)"
+    [ -n "$matches" ] || return 0
+    printf '%s\n' "$matches" | sort -V | tail -n 1
+}
+
+run_privileged() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif command -v pkexec >/dev/null 2>&1; then
+        pkexec "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+install_native_package() {
+    local pkg
+
+    if command -v pacman >/dev/null 2>&1; then
+        pkg="$(latest_matching_file "$ROOT_DIR/dist/codex-desktop-*.pkg.tar.*")"
+        if [ -n "$pkg" ]; then
+            info "Installing $pkg"
+            run_privileged pacman -U --noconfirm "$pkg"
+            return
+        fi
+    fi
+
+    CODEX_LINUX_FEATURES_CONFIG="$FEATURE_CONFIG" make install
+}
+
 build_and_install() {
     local build_target
 
@@ -256,7 +289,7 @@ build_and_install() {
 
     if truthy "$INSTALL_PACKAGE"; then
         info "Installing native package"
-        CODEX_LINUX_FEATURES_CONFIG="$FEATURE_CONFIG" make install
+        install_native_package
         if command -v kbuildsycoca6 >/dev/null 2>&1; then
             kbuildsycoca6 >/dev/null 2>&1 || true
         fi
