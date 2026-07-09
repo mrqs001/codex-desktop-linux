@@ -29,8 +29,11 @@ which wraps the launcher so `CODEX_CLI_PATH` is always set.
 One direct upstream install path is the npm package:
 
 ```bash
-npm i -g @openai/codex
+npm i -g --include=optional @openai/codex
 ```
+
+The `--include=optional` flag ensures npm also installs the Linux platform
+binary package that the CLI loads at runtime.
 
 ### Community Nix CLI Packages
 

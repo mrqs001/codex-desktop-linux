@@ -9,10 +9,12 @@ use anyhow::{Context, Result};
 use std::{
     ffi::OsString,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 use tokio::process::Command;
 use tracing::info;
+
+const UPDATE_BUILDER_MANIFEST: &str = ".codex-linux/update-builder-manifest.txt";
 
 const REQUIRED_BUNDLE_FILES: [(&str, &str); 19] = [
     ("Cargo.toml", "Cargo.toml"),
@@ -238,6 +240,11 @@ fn package_build_script(bundle_dir: &Path) -> PathBuf {
 }
 
 fn copy_builder_bundle(source_root: &Path, destination_root: &Path) -> Result<()> {
+    let manifest_path = source_root.join(UPDATE_BUILDER_MANIFEST);
+    if manifest_path.exists() {
+        return copy_builder_bundle_from_manifest(source_root, destination_root, &manifest_path);
+    }
+
     for (source, destination) in REQUIRED_BUNDLE_FILES {
         copy_entry(
             &source_root.join(source),
@@ -255,6 +262,54 @@ fn copy_builder_bundle(source_root: &Path, destination_root: &Path) -> Result<()
     }
 
     Ok(())
+}
+
+fn copy_builder_bundle_from_manifest(
+    source_root: &Path,
+    destination_root: &Path,
+    manifest_path: &Path,
+) -> Result<()> {
+    let manifest = fs::read_to_string(manifest_path)
+        .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+
+    for (index, line) in manifest.lines().enumerate() {
+        let entry = line.trim();
+        if entry.is_empty() || entry.starts_with('#') {
+            continue;
+        }
+        let relative_path = Path::new(entry);
+        if !is_safe_manifest_relative_path(relative_path) {
+            anyhow::bail!(
+                "Unsafe update-builder manifest entry at line {}: {}",
+                index + 1,
+                entry
+            );
+        }
+        copy_entry(
+            &source_root.join(relative_path),
+            &destination_root.join(relative_path),
+            false,
+        )?;
+    }
+
+    copy_entry(
+        manifest_path,
+        &destination_root.join(UPDATE_BUILDER_MANIFEST),
+        false,
+    )?;
+    Ok(())
+}
+
+fn is_safe_manifest_relative_path(path: &Path) -> bool {
+    let mut has_component = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => has_component = true,
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    has_component && !path.is_absolute()
 }
 
 fn copy_entry(source: &Path, destination: &Path, optional: bool) -> Result<()> {
@@ -478,6 +533,18 @@ mod tests {
         Pacman,
     }
 
+    const FRESH_PATCH_BUNDLE_FILES: &[&str] = &[
+        "scripts/patches/descriptor.js",
+        "scripts/patches/engine.js",
+        "scripts/patches/runner.js",
+        "scripts/patches/lib/assets.js",
+        "scripts/patches/lib/minified-js.js",
+        "scripts/patches/lib/settings-keys.js",
+        "scripts/patches/impl/webview/index.js",
+        "scripts/patches/core/all-linux/main-process/lifecycle/patch.js",
+        "scripts/patches/core/all-linux/webview/theme-and-sunset/patch.js",
+    ];
+
     fn write_fake_build_script(path: &Path, output: FakePackageOutput) -> Result<()> {
         let script_body = match output {
             FakePackageOutput::Deb => {
@@ -583,6 +650,37 @@ touch "${DIST_DIR_OVERRIDE}/codex-desktop-${VER}-1-x86_64.pkg.tar.zst"
         Ok(())
     }
 
+    fn write_fake_patch_bundle(root: &Path) -> Result<()> {
+        for relative_path in FRESH_PATCH_BUNDLE_FILES {
+            let file_path = root.join(relative_path);
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(file_path, b"module.exports = {};\n")?;
+        }
+        Ok(())
+    }
+
+    fn assert_fresh_patch_bundle(root: &Path) {
+        for relative_path in FRESH_PATCH_BUNDLE_FILES {
+            let file_path = root.join(relative_path);
+            assert!(
+                file_path.exists(),
+                "expected fresh patch bundle file {}",
+                file_path.display()
+            );
+        }
+        let stale_registry = root
+            .join("scripts/patches")
+            .join("registry")
+            .with_extension("js");
+        assert!(
+            !stale_registry.exists(),
+            "stale patch registry should not be present at {}",
+            stale_registry.display()
+        );
+    }
+
     #[tokio::test]
     async fn builds_update_with_fake_bundle() -> Result<()> {
         let temp = tempdir()?;
@@ -590,13 +688,13 @@ touch "${DIST_DIR_OVERRIDE}/codex-desktop-${VER}-1-x86_64.pkg.tar.zst"
         let state_root = temp.path().join("state");
         let cache_root = temp.path().join("cache");
         fs::create_dir_all(bundle_root.join("scripts/lib"))?;
-        fs::create_dir_all(bundle_root.join("scripts/patches"))?;
         fs::create_dir_all(bundle_root.join("launcher"))?;
         fs::create_dir_all(bundle_root.join("packaging/linux"))?;
         fs::create_dir_all(bundle_root.join("assets"))?;
         fs::create_dir_all(bundle_root.join(".codex-linux"))?;
         write_fake_computer_use_bundle(&bundle_root)?;
         write_fake_linux_features_bundle(&bundle_root)?;
+        write_fake_patch_bundle(&bundle_root)?;
         fs::write(bundle_root.join("CHANGELOG.md"), b"# Changelog\n")?;
         fs::write(
             bundle_root.join(".codex-linux/source-info.json"),
@@ -703,10 +801,6 @@ fi
             b"console.log('patched');\n",
         )?;
         fs::write(
-            bundle_root.join("scripts/patches/registry.js"),
-            b"module.exports = {};\n",
-        )?;
-        fs::write(
             bundle_root.join("scripts/lib/package-common.sh"),
             b"#!/bin/bash\n",
         )?;
@@ -782,10 +876,7 @@ fi
             .workspace_dir
             .join("builder/scripts/lib/node-runtime.sh")
             .exists());
-        assert!(artifacts
-            .workspace_dir
-            .join("builder/scripts/patches/registry.js")
-            .exists());
+        assert_fresh_patch_bundle(&artifacts.workspace_dir.join("builder"));
         assert!(artifacts
             .workspace_dir
             .join("builder/linux-features/features.example.json")
@@ -813,12 +904,12 @@ fi
         let destination_root = temp.path().join("destination");
 
         fs::create_dir_all(source_root.join("scripts/lib"))?;
-        fs::create_dir_all(source_root.join("scripts/patches"))?;
         fs::create_dir_all(source_root.join("launcher"))?;
         fs::create_dir_all(source_root.join("packaging/linux"))?;
         fs::create_dir_all(source_root.join("assets"))?;
         write_fake_computer_use_bundle(&source_root)?;
         write_fake_linux_features_bundle(&source_root)?;
+        write_fake_patch_bundle(&source_root)?;
         fs::write(source_root.join("install.sh"), b"#!/bin/bash\n")?;
         fs::write(
             source_root.join("launcher/start.sh.template"),
@@ -832,10 +923,6 @@ fi
         fs::write(
             source_root.join("scripts/patch-linux-window-ui.js"),
             b"console.log('patched');\n",
-        )?;
-        fs::write(
-            source_root.join("scripts/patches/registry.js"),
-            b"module.exports = {};\n",
         )?;
         fs::write(
             source_root.join("scripts/lib/package-common.sh"),
@@ -863,9 +950,7 @@ fi
             .join("scripts/patch-linux-window-ui.js")
             .exists());
         assert!(destination_root.join("launcher/webview-server.py").exists());
-        assert!(destination_root
-            .join("scripts/patches/registry.js")
-            .exists());
+        assert_fresh_patch_bundle(&destination_root);
         assert!(destination_root.join("computer-use-linux").exists());
         assert!(destination_root.join("read-aloud-linux").exists());
         assert!(destination_root.join("record-replay-linux").exists());
@@ -885,6 +970,72 @@ fi
             .exists());
         assert!(!destination_root.join("scripts/build-rpm.sh").exists());
         assert!(!destination_root.join("scripts/build-pacman.sh").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn bundle_copy_prefers_packaged_update_builder_manifest() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let destination_root = temp.path().join("destination");
+
+        fs::create_dir_all(source_root.join(".codex-linux"))?;
+        fs::create_dir_all(source_root.join("assets"))?;
+        fs::create_dir_all(source_root.join("record-replay-linux"))?;
+        fs::create_dir_all(source_root.join("scripts"))?;
+        fs::write(source_root.join("assets/codex-linux.png"), b"linux png")?;
+        fs::write(
+            source_root.join("record-replay-linux/Cargo.toml"),
+            b"[package]\nname = \"codex-record-replay-linux\"\n",
+        )?;
+        fs::write(source_root.join("scripts/build-deb.sh"), b"#!/bin/bash\n")?;
+        fs::write(
+            source_root.join(UPDATE_BUILDER_MANIFEST),
+            b"# generated\nassets/codex-linux.png\nrecord-replay-linux/Cargo.toml\n",
+        )?;
+
+        copy_builder_bundle(&source_root, &destination_root)?;
+
+        assert!(destination_root.join("assets/codex-linux.png").exists());
+        assert!(destination_root
+            .join("record-replay-linux/Cargo.toml")
+            .exists());
+        assert!(destination_root.join(UPDATE_BUILDER_MANIFEST).exists());
+        assert!(!destination_root.join("scripts/build-deb.sh").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn bundle_manifest_rejects_parent_paths() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let destination_root = temp.path().join("destination");
+
+        fs::create_dir_all(source_root.join(".codex-linux"))?;
+        fs::write(source_root.join(UPDATE_BUILDER_MANIFEST), b"../escape\n")?;
+
+        let error = copy_builder_bundle(&source_root, &destination_root)
+            .expect_err("manifest parent path should be rejected");
+        assert!(error
+            .to_string()
+            .contains("Unsafe update-builder manifest entry"));
+        Ok(())
+    }
+
+    #[test]
+    fn bundle_manifest_rejects_absolute_paths() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("source");
+        let destination_root = temp.path().join("destination");
+
+        fs::create_dir_all(source_root.join(".codex-linux"))?;
+        fs::write(source_root.join(UPDATE_BUILDER_MANIFEST), b"/tmp/escape\n")?;
+
+        let error = copy_builder_bundle(&source_root, &destination_root)
+            .expect_err("manifest absolute path should be rejected");
+        assert!(error
+            .to_string()
+            .contains("Unsafe update-builder manifest entry"));
         Ok(())
     }
 
