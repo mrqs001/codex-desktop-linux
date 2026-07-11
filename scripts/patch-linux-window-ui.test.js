@@ -2214,9 +2214,9 @@ test("adds the Linux quit guard to the current comma-declared Electron prelude",
 
   const patched = applyPatchTwice(applyLinuxQuitGuardPatch, source);
 
-  assert.match(patched, /let codexLinuxQuitInProgress=!1/);
+  assert.match(patched, /codexLinuxQuitInProgress=!1/);
   assert.match(patched, /codexLinuxExplicitQuitApproved=!1/);
-  assert.match(patched, /codexLinuxMarkQuitInProgress=\(\)=>\{codexLinuxQuitInProgress=!0\}/);
+  assert.match(patched, /codexLinuxMarkQuitInProgress=\(\)=>\{codexLinuxQuitInProgress=!0,codexLinuxDestroyTray\(\)\}/);
   assert.match(patched, /codexLinuxPrepareForExplicitQuit=\(\)=>\{codexLinuxExplicitQuitApproved=!0,codexLinuxMarkQuitInProgress\(\)\}/);
   assert.match(patched, /codexLinuxShouldBypassQuitPrompt=\(\)=>codexLinuxExplicitQuitApproved===!0/);
   assert.match(patched, /codexLinuxIsQuitInProgress=\(\)=>codexLinuxQuitInProgress===!0/);
@@ -2227,7 +2227,7 @@ test("keeps the current Linux quit guard module-scoped after helper declarations
 
   const patched = applyPatchTwice(applyLinuxQuitGuardPatch, source);
 
-  assert.match(patched, /p=e\.o\(p\);let codexLinuxQuitInProgress=!1/);
+  assert.match(patched, /p=e\.o\(p\);let codexLinuxTray=null/);
   assert.match(patched, /codexLinuxExplicitQuitApproved=!1/);
   assert.match(patched, /codexLinuxPrepareForExplicitQuit=\(\)=>\{codexLinuxExplicitQuitApproved=!0,codexLinuxMarkQuitInProgress\(\)\}/);
   assert.equal((patched.match(/codexLinuxQuitInProgress=!1/g) ?? []).length, 1);
@@ -2239,10 +2239,36 @@ test("adds the Linux quit guard for the current interleaved bundler prelude", ()
   const patched = applyPatchTwice(applyLinuxQuitGuardPatch, source);
 
   assert.match(patched, /let m=require\(`node:fs\/promises`\);/);
-  assert.match(patched, /p=e\.o\(p\);let codexLinuxQuitInProgress=!1/);
+  assert.match(patched, /p=e\.o\(p\);let codexLinuxTray=null/);
   assert.match(patched, /codexLinuxExplicitQuitApproved=!1/);
   assert.match(patched, /codexLinuxPrepareForExplicitQuit=\(\)=>\{codexLinuxExplicitQuitApproved=!0,codexLinuxMarkQuitInProgress\(\)\}/);
   assert.equal((patched.match(/codexLinuxQuitInProgress=!1/g) ?? []).length, 1);
+});
+
+test("destroys the registered Linux tray before the app exits", () => {
+  const source = `${currentMainBundlePrefix}${trayBundleFixture()}`;
+  const patched = applyPatchTwice(
+    applyLinuxTrayPatch,
+    applyLinuxQuitGuardPatch(source),
+    null,
+  );
+
+  assert.match(patched, /codexLinuxRegisterTray=e=>\(codexLinuxTray=e,e\)/);
+  assert.match(patched, /codexLinuxDestroyTray=\(\)=>\{if\(process\.platform!==`linux`\)return;/);
+  assert.match(patched, /codexLinuxTray=null;try\{e\?\.destroy\(\)\}catch\{\}/);
+  assert.match(patched, /codexLinuxMarkQuitInProgress=\(\)=>\{codexLinuxQuitInProgress=!0,codexLinuxDestroyTray\(\)\}/);
+  assert.match(patched, /c\.app\.on\(`before-quit`,\(\)=>codexLinuxDestroyTray\(\)\)/);
+  assert.match(patched, /i=typeof codexLinuxRegisterTray===`function`\?codexLinuxRegisterTray\(new n\.Tray\(r\.defaultIcon\)\):new n\.Tray\(r\.defaultIcon\)/);
+  assert.doesNotMatch(patched, /codexLinuxTrayQuitDelayMs/);
+
+  const helperStart = patched.indexOf("let codexLinuxTray=null");
+  const helperEnd = patched.indexOf(";c.app.on(`before-quit`", helperStart) + 1;
+  const helperSource = patched.slice(helperStart, helperEnd);
+  const runDestroy = new Function(
+    "process",
+    `${helperSource}let calls=0;codexLinuxRegisterTray({destroy(){calls+=1}});codexLinuxMarkQuitInProgress();codexLinuxMarkQuitInProgress();return calls;`,
+  );
+  assert.equal(runDestroy({ platform: "linux" }), 1);
 });
 
 test("bypasses the upstream before-quit confirmation after a Linux explicit quit", () => {
