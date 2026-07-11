@@ -2,6 +2,7 @@
 
 const VALID_GRAVITIES = new Set(["bottom-right", "bottom-left", "top-right", "top-left"]);
 const DESCRIPTOR_ID = "pet-overlay-main";
+const AVATAR_SELECTION_REFRESH_MARKER = "codexPetOverlayRefreshAvatarWindows";
 
 function findMatchingBrace(source, openIndex) {
   let depth = 0;
@@ -270,7 +271,25 @@ function patchPassiveCreateWindow(source, settings) {
     .join("appearance:`avatarOverlay`,alwaysOnTop:process.platform===`linux`,skipTaskbar:process.platform===`linux`,focusable:!1");
 }
 
-function hasCompletePetOverlayPatch(source, settings) {
+function patchAvatarSelectionRefresh(source) {
+  if (source.includes(`function ${AVATAR_SELECTION_REFRESH_MARKER}(`)) {
+    return source;
+  }
+
+  const handlerRegex = /"set-setting":async\(\{key:([A-Za-z_$][\w$]*),value:([A-Za-z_$][\w$]*)\}\)=>\(this\.setSettingValue\(\1,\2\),\{success:!0\}\)/;
+  const match = source.match(handlerRegex);
+  if (match == null) {
+    console.warn("WARN: Could not find desktop set-setting handler - skipping pet selection refresh");
+    return source;
+  }
+
+  const [handler, keyVar, valueVar] = match;
+  const helper = `function ${AVATAR_SELECTION_REFRESH_MARKER}(){try{setTimeout(()=>{for(let e of require(\`electron\`).BrowserWindow.getAllWindows()){if(e?.isDestroyed?.()||String(e?.getTitle?.()??\`\`)!==\`Codex Pet Overlay\`)continue;let t=e.webContents;t==null||t.isDestroyed?.()||t.reload?.()}},0)}catch{}}`;
+  const replacement = `"set-setting":async({key:${keyVar},value:${valueVar}})=>(this.setSettingValue(${keyVar},${valueVar}),${keyVar}===\`selected-avatar-id\`&&${AVATAR_SELECTION_REFRESH_MARKER}(),{success:!0})`;
+  return helper + source.replace(handler, replacement);
+}
+
+function hasCompletePetOverlayPatch(source, settings, avatarSelectionRefreshExpected) {
   const requiredMarkers = [
     source.includes("codexPetOverlaySettings(){"),
     /let [A-Za-z_$][\w$]*=this\.codexPetOverlayLayoutForDisplay\([A-Za-z_$][\w$]*,this\.getLayoutForDisplay\([A-Za-z_$][\w$]*\),[A-Za-z_$][\w$]*\);/.test(source),
@@ -278,6 +297,12 @@ function hasCompletePetOverlayPatch(source, settings) {
     source.includes("if(this.codexPetOverlayShouldLockPosition())return;"),
     source.includes("===`avatarOverlay`?{backgroundColor:`#00000000`,backgroundMaterial:null}:"),
   ];
+  if (avatarSelectionRefreshExpected) {
+    requiredMarkers.push(
+      source.includes(`function ${AVATAR_SELECTION_REFRESH_MARKER}(`),
+      source.includes("===`selected-avatar-id`&&codexPetOverlayRefreshAvatarWindows()"),
+    );
+  }
   if (settings.mode === "passive") {
     requiredMarkers.push(
       source.includes("appearance:`avatarOverlay`,alwaysOnTop:process.platform===`linux`,skipTaskbar:process.platform===`linux`,focusable:!1"),
@@ -311,13 +336,17 @@ function applyPetOverlayPatch(source, context) {
     return source;
   }
   const settings = mergedPetOverlaySettings(context);
+  const avatarSelectionRefreshExpected = source.includes('"set-setting":async');
   let patched = patchAvatarTransparentBackground(source);
   patched = patchApplyLayout(patched);
   patched = patchShowWindow(patched);
   patched = patchLockedDrag(patched);
   patched = ensurePetOverlayMethods(patched, settings);
   patched = patchPassiveCreateWindow(patched, settings);
-  if (!hasCompletePetOverlayPatch(patched, settings)) {
+  if (avatarSelectionRefreshExpected) {
+    patched = patchAvatarSelectionRefresh(patched);
+  }
+  if (!hasCompletePetOverlayPatch(patched, settings, avatarSelectionRefreshExpected)) {
     console.warn("WARN: Pet overlay patch is incomplete - discarding all pet overlay changes");
     return source;
   }
