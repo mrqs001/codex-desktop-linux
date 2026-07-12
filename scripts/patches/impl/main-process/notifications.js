@@ -69,6 +69,13 @@ function codexLinuxCreateActionNotification(options, fallbackFactory, runtime) {
   };
   const startFallback = () => {
     if (closed || mode === "fallback") return;
+    if (closeRequested) {
+      try {
+        child?.kill();
+      } catch {}
+      emitClose();
+      return;
+    }
     mode = "fallback";
     try {
       child?.kill();
@@ -85,6 +92,7 @@ function codexLinuxCreateActionNotification(options, fallbackFactory, runtime) {
       return;
     }
     if (mode !== "bridge") return;
+    if (closeRequested && event?.event !== "closed" && event?.event !== "unavailable") return;
     switch (event?.event) {
       case "shown":
         shown = true;
@@ -108,7 +116,7 @@ function codexLinuxCreateActionNotification(options, fallbackFactory, runtime) {
 
   return {
     show: () => {
-      if (closed || mode !== "idle") return;
+      if (closed || closeRequested || mode !== "idle") return;
       mode = "bridge";
       try {
         const spawn = runtime?.spawn ?? require("node:child_process").spawn;
@@ -166,6 +174,10 @@ function codexLinuxCreateActionNotification(options, fallbackFactory, runtime) {
         return;
       }
       closeRequested = true;
+      if (mode === "idle") {
+        emitClose();
+        return;
+      }
       try {
         child?.stdin?.end("close\n");
       } catch {

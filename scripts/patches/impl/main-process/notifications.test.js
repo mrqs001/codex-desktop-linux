@@ -163,3 +163,67 @@ test("programmatic close waits for the bridge close event and forwards it once",
 
   assert.equal(closeCount, 1);
 });
+
+test("close before show prevents both bridge and fallback notifications", () => {
+  let spawnCount = 0;
+  let fallbackCount = 0;
+  let closeCount = 0;
+  const notification = codexLinuxCreateActionNotification(
+    { title: "Approval", body: "Required", actions: [{ text: "Approve" }] },
+    () => {
+      fallbackCount += 1;
+      return null;
+    },
+    {
+      bridgePath: "/test/bridge",
+      spawn: () => {
+        spawnCount += 1;
+        return fakeBridgeProcess();
+      },
+    },
+  );
+  notification.on("close", () => {
+    closeCount += 1;
+  });
+
+  notification.close();
+  notification.show();
+
+  assert.equal(spawnCount, 0);
+  assert.equal(fallbackCount, 0);
+  assert.equal(closeCount, 1);
+});
+
+test("close while the bridge starts prevents a later fallback", () => {
+  const child = fakeBridgeProcess();
+  let actionCount = 0;
+  let fallbackCount = 0;
+  let closeCount = 0;
+  const notification = codexLinuxCreateActionNotification(
+    { title: "Approval", body: "Required", actions: [{ text: "Approve" }] },
+    () => {
+      fallbackCount += 1;
+      return null;
+    },
+    { bridgePath: "/test/bridge", spawn: () => child },
+  );
+  notification.on("close", () => {
+    closeCount += 1;
+  });
+  notification.on("action", () => {
+    actionCount += 1;
+  });
+  notification.show();
+
+  notification.close();
+  child.stdout.emit("data", Buffer.from('{"event":"action","index":0}\n'));
+  child.stdout.emit(
+    "data",
+    Buffer.from('{"event":"unavailable","reason":"notification-actions-unsupported"}\n'),
+  );
+  child.emit("exit", 0);
+
+  assert.equal(fallbackCount, 0);
+  assert.equal(actionCount, 0);
+  assert.equal(closeCount, 1);
+});
