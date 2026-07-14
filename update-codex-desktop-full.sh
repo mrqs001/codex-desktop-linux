@@ -127,12 +127,10 @@ else
     "agent-workspace",
     "appshots",
     "codex-wrapper-updater",
-    "conversation-mode",
     "copilot-reasoning-effort",
     "open-target-discovery",
     "read-aloud",
     "read-aloud-mcp",
-    "remote-control-ui",
     "remote-mobile-control",
     "thorium-chrome-plugin",
     "x11-ewmh-computer-use"
