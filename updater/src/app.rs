@@ -11,7 +11,6 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
-use reqwest::Client;
 use serde::Deserialize;
 use std::{
     ffi::OsString,
@@ -240,6 +239,20 @@ fn maybe_prune_generated_artifacts(config: &RuntimeConfig) {
 
 fn maybe_prune_caches(config: &RuntimeConfig, state: &PersistedState) {
     maybe_prune_workspace_cache(&config.workspace_root, state);
+    match cache_cleanup::prune_dmg_cache(&config.workspace_root, state) {
+        Ok(summary) if summary.pruned_dmgs > 0 || summary.pruned_temps > 0 => {
+            info!(
+                pruned_dmgs = summary.pruned_dmgs,
+                pruned_temps = summary.pruned_temps,
+                "pruned updater DMG cache"
+            );
+        }
+        Ok(summary) if summary.skipped_locked => {
+            info!("skipping DMG cache cleanup while another updater flow holds its lease");
+        }
+        Ok(_) => {}
+        Err(error) => warn!(?error, "failed to prune updater DMG cache"),
+    }
     maybe_prune_generated_artifacts(config);
 }
 
@@ -402,7 +415,7 @@ async fn run_daemon(
     }
     info!("daemon initialized");
 
-    time::sleep(Duration::from_secs(config.initial_check_delay_seconds)).await;
+    time::sleep(config.initial_check_delay_duration()).await;
     if let Err(error) = run_check_cycle_from_disk(config, state, paths).await {
         error!(?error, "initial check failed");
     }
@@ -410,8 +423,7 @@ async fn run_daemon(
         error!(?error, "initial reconciliation failed");
     }
 
-    let mut check_interval =
-        time::interval(Duration::from_secs(config.check_interval_hours * 3600));
+    let mut check_interval = time::interval(config.check_interval_duration()?);
     let mut reconcile_interval = time::interval(Duration::from_secs(RECONCILE_INTERVAL_SECONDS));
     check_interval.tick().await;
     reconcile_interval.tick().await;
@@ -535,7 +547,7 @@ fn detect_and_record_wrapper_update(
                 paths,
                 config.notifications,
                 &format!("wrapper_update:{}", update.candidate_commit),
-                "Codex Desktop wrapper update available",
+                "ChatGPT Desktop wrapper update available",
                 &format!(
                     "A newer Linux wrapper build is available ({change_count} change(s)). Rebuild to apply."
                 ),
@@ -614,7 +626,9 @@ fn upstream_check_is_fresh(config: &RuntimeConfig, state: &PersistedState) -> bo
         return false;
     };
 
-    let freshness_window = ChronoDuration::hours(config.check_interval_hours as i64);
+    let Ok(freshness_window) = config.check_interval_chrono_duration() else {
+        return false;
+    };
     Utc::now().signed_duration_since(last_successful_check_at) < freshness_window
 }
 
@@ -863,7 +877,7 @@ fn run_kdialog_prompt() -> Result<bool> {
     let status = Command::new("kdialog")
         .args([
             "--title",
-            "Codex Desktop",
+            "ChatGPT Desktop",
             "--yesno",
             "Codex CLI is not installed. Install it now?",
         ])
@@ -876,7 +890,7 @@ fn run_zenity_prompt() -> Result<bool> {
     let status = Command::new("zenity")
         .args([
             "--question",
-            "--title=Codex Desktop",
+            "--title=ChatGPT Desktop",
             "--text=Codex CLI is not installed. Install it now?",
         ])
         .status()
@@ -887,7 +901,7 @@ fn run_zenity_prompt() -> Result<bool> {
 fn run_actionable_notification_prompt() -> Result<bool> {
     match notify::send_actionable(
         "Codex CLI not installed",
-        "Codex Desktop needs the Codex CLI. Choose Install now to let Codex Desktop install it.",
+        "ChatGPT Desktop needs the Codex CLI. Choose Install now to let ChatGPT Desktop install it.",
         &[("install", "Install now"), ("dismiss", "Dismiss")],
     )? {
         notify::ActionResponse::Invoked(action) if action == "install" => Ok(true),
@@ -933,7 +947,7 @@ async fn run_check_cycle(
         return Ok(());
     };
 
-    let client = Client::builder().build()?;
+    let client = upstream::http_client()?;
 
     sync_runtime_state(config, state);
     state.status = UpdateStatus::CheckingUpstream;
@@ -973,13 +987,7 @@ async fn run_check_cycle(
             return Ok(());
         }
 
-        if state
-            .rollback_blocked_candidate_version
-            .as_deref()
-            .is_some_and(|blocked| {
-                installed_version_matches_candidate(blocked, &downloaded.candidate_version)
-            })
-        {
+        if rollback_blocks_candidate(state, &downloaded.sha256, &downloaded.candidate_version) {
             state.status = UpdateStatus::Idle;
             state.error_message = Some(format!(
                 "Candidate {} was rolled back and will not be reinstalled automatically",
@@ -1005,8 +1013,8 @@ async fn run_check_cycle(
 
         rollback::record_current_package_as_known_good(state);
         state.status = UpdateStatus::UpdateDetected;
-        state.candidate_version = Some(downloaded.candidate_version);
-        state.dmg_sha256 = Some(downloaded.sha256);
+        state.candidate_version = Some(downloaded.candidate_version.clone());
+        state.dmg_sha256 = Some(downloaded.sha256.clone());
         state.artifact_paths.dmg_path = Some(downloaded.path.clone());
         state.notified_events.clear();
         state.save(&paths.state_file)?;
@@ -1016,7 +1024,7 @@ async fn run_check_cycle(
             paths,
             config.notifications,
             "update_detected",
-            "New Codex Desktop update detected",
+            "New ChatGPT Desktop update detected",
             "Preparing a local Linux package from the new upstream DMG.",
         )?;
 
@@ -1025,15 +1033,17 @@ async fn run_check_cycle(
             .clone()
             .expect("candidate version should be set before local build");
         builder::build_update(config, state, paths, &candidate_version, &downloaded.path).await?;
-        maybe_prune_caches(config, state);
+        drop(downloaded);
         maybe_notify_update_ready(state, paths, config.notifications)?;
         Ok(())
     }
     .await;
 
+    // Every check outcome, including an early no-update return, releases its
+    // DMG lease before bounded cache cleanup runs here.
+    maybe_prune_caches(config, state);
     if let Err(error) = result {
         mark_failed_and_persist(state, paths, error.to_string())?;
-        maybe_prune_caches(config, state);
         let _ = notify_failure(config, state, paths, &error);
         return Err(error);
     }
@@ -1096,8 +1106,8 @@ async fn reconcile_pending_install(
                     paths,
                     config.notifications,
                     "ready_to_install",
-                    "Codex Desktop update ready",
-                    "Close Codex Desktop to install the ready update.",
+                    "ChatGPT Desktop update ready",
+                    "Close ChatGPT Desktop to install the ready update.",
                 )?;
                 return Ok(());
             }
@@ -1138,8 +1148,8 @@ async fn reconcile_pending_install(
                     paths,
                     config.notifications,
                     "waiting_for_app_exit",
-                    "Codex Desktop update ready",
-                    "The update will install after you close Codex Desktop.",
+                    "ChatGPT Desktop update ready",
+                    "The update will install after you close ChatGPT Desktop.",
                 )?;
                 return Ok(());
             }
@@ -1171,7 +1181,7 @@ async fn run_install_ready(
     recover_interrupted_install(state, paths)?;
 
     if complete_current_dmg_update_if_already_installed(config, state, paths)? {
-        println!("Codex Desktop is already up to date.");
+        println!("ChatGPT Desktop is already up to date.");
         return Ok(());
     }
 
@@ -1180,7 +1190,7 @@ async fn run_install_ready(
         if pending_recovery.should_notify_installed() {
             let _ = maybe_notify_installed(state, paths, config.notifications);
         }
-        println!("Codex Desktop update is already installed or superseded.");
+        println!("ChatGPT Desktop update is already installed or superseded.");
         return Ok(());
     }
 
@@ -1189,19 +1199,19 @@ async fn run_install_ready(
         UpdateStatus::Installing => {
             maybe_send_notification(
                 config.notifications,
-                "Codex update already installing",
-                "Codex Desktop is already applying the ready update.",
+                "ChatGPT Desktop update already installing",
+                "ChatGPT Desktop is already applying the ready update.",
             );
-            println!("Codex Desktop update is already installing.");
+            println!("ChatGPT Desktop update is already installing.");
             return Ok(());
         }
         _ => {
             maybe_send_notification(
                 config.notifications,
-                "No Codex update ready",
-                "There is no rebuilt Codex Desktop update waiting to install.",
+                "No ChatGPT Desktop update ready",
+                "There is no rebuilt ChatGPT Desktop update waiting to install.",
             );
-            println!("No Codex Desktop update is ready to install.");
+            println!("No update is ready to install.");
             return Ok(());
         }
     }
@@ -1210,7 +1220,7 @@ async fn run_install_ready(
         mark_failed_and_persist(state, paths, "No ready update package is recorded")?;
         maybe_send_notification(
             config.notifications,
-            "Codex update failed",
+            "ChatGPT Desktop update failed",
             "The updater has no package path recorded for the ready update.",
         );
         println!("No ready update package is recorded.");
@@ -1228,7 +1238,7 @@ async fn run_install_ready(
         )?;
         maybe_send_notification(
             config.notifications,
-            "Codex update failed",
+            "ChatGPT Desktop update failed",
             "The rebuilt package is missing. Check the updater log for details.",
         );
         println!(
@@ -1249,10 +1259,10 @@ async fn run_install_ready(
         set_waiting_for_app_exit(state, paths, false)?;
         maybe_send_notification(
             config.notifications,
-            "Codex Desktop update ready",
-            "Close Codex Desktop to install the ready update.",
+            "ChatGPT Desktop update ready",
+            "Close ChatGPT Desktop to install the ready update.",
         );
-        println!("Codex Desktop is running. Close it to install the ready update.");
+        println!("ChatGPT Desktop is running. Close it to install the ready update.");
         return Ok(());
     }
 
@@ -1397,6 +1407,7 @@ fn complete_pending_install_if_already_installed(
     state.status = UpdateStatus::Installed;
     state.waiting_for_app_exit_auto_install = false;
     state.candidate_version = None;
+    clear_rollback_blocked_candidate(state);
     if !candidate_is_installed {
         state.artifact_paths.package_path = None;
     }
@@ -1422,6 +1433,7 @@ fn recover_interrupted_install(state: &mut PersistedState, paths: &RuntimePaths)
         state.status = UpdateStatus::Installed;
         state.waiting_for_app_exit_auto_install = false;
         state.candidate_version = None;
+        clear_rollback_blocked_candidate(state);
         if !candidate_is_installed {
             state.artifact_paths.package_path = None;
         }
@@ -1486,6 +1498,25 @@ fn installed_version_matches_candidate(installed: &str, candidate: &str) -> bool
         Some(_) => false,
         None => installed == candidate,
     }
+}
+
+fn rollback_blocks_candidate(
+    state: &PersistedState,
+    candidate_sha256: &str,
+    candidate_version: &str,
+) -> bool {
+    match state.rollback_blocked_dmg_sha256.as_deref() {
+        Some(blocked_sha256) => blocked_sha256 == candidate_sha256,
+        None => state
+            .rollback_blocked_candidate_version
+            .as_deref()
+            .is_some_and(|blocked| installed_version_matches_candidate(blocked, candidate_version)),
+    }
+}
+
+fn clear_rollback_blocked_candidate(state: &mut PersistedState) {
+    state.rollback_blocked_candidate_version = None;
+    state.rollback_blocked_dmg_sha256 = None;
 }
 
 fn compare_generated_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
@@ -1582,7 +1613,7 @@ fn maybe_notify_cli_missing(
         enabled,
         CLI_MISSING_NOTIFICATION_EVENT,
         "Codex CLI not installed",
-        "Codex Desktop needs the Codex CLI. Open the app to retry the automatic install flow, or install it manually with npm.",
+        "ChatGPT Desktop needs the Codex CLI. Open the app to retry the automatic install flow, or install it manually with npm.",
     )
 }
 
@@ -1600,7 +1631,7 @@ fn maybe_notify_installed(
         paths,
         enabled,
         "installed",
-        "Codex Desktop updated",
+        "ChatGPT Desktop updated",
         "The new package is installed and will be used the next time you open the app.",
     )
 }
@@ -1621,11 +1652,11 @@ fn maybe_notify_update_ready(
 
     if enabled {
         let body = if state.auto_install_on_app_exit {
-            "A rebuilt Linux package is ready. Close Codex Desktop to install it, or open Codex Desktop and choose Update."
+            "A rebuilt Linux package is ready. Close ChatGPT Desktop to install it, or open ChatGPT Desktop and choose Update."
         } else {
-            "A rebuilt Linux package is ready. Open Codex Desktop and choose Update to install it."
+            "A rebuilt Linux package is ready. Open ChatGPT Desktop and choose Update to install it."
         };
-        if let Err(error) = notify::send("Codex Desktop update ready", body) {
+        if let Err(error) = notify::send("ChatGPT Desktop update ready", body) {
             warn!(?error, "failed to send update-ready notification");
         }
     }
@@ -1652,7 +1683,7 @@ async fn trigger_install(
     persist_state(paths, state)?;
 
     let _ = notify::send(
-        "Installing Codex Desktop update",
+        "Installing ChatGPT Desktop update",
         "Applying the locally rebuilt Linux package.",
     );
 
@@ -1667,7 +1698,7 @@ async fn trigger_install(
         state.waiting_for_app_exit_auto_install = false;
         state.installed_version = install::installed_package_version();
         state.candidate_version = None;
-        state.rollback_blocked_candidate_version = None;
+        clear_rollback_blocked_candidate(state);
         state.error_message = None;
         state.notified_events.clear();
         cache_cleanup::normalize_artifact_workspace_dir(workspace_root, state);
@@ -1700,7 +1731,7 @@ async fn trigger_install(
 
     mark_failed_and_persist(state, paths, error.to_string())?;
     let _ = notify::send(
-        "Codex update failed",
+        "ChatGPT Desktop update failed",
         "The package could not be installed. Check the updater log for details.",
     );
     Err(error)
@@ -1725,7 +1756,7 @@ fn install_auth_retry_is_blocked(state: &PersistedState) -> bool {
 
 fn manual_install_required_message(package_path: &Path) -> String {
     format!(
-        "No graphical polkit authentication agent is available for pkexec. Run this from a terminal after closing Codex Desktop: {}",
+        "No graphical polkit authentication agent is available for pkexec. Run this from a terminal after closing ChatGPT Desktop: {}",
         manual_install_command(package_path)
     )
 }
@@ -1749,7 +1780,7 @@ fn shell_quote_path(path: &Path) -> String {
 
 fn print_manual_install_required(package_path: &Path) {
     println!("Manual install required: no graphical polkit authentication agent is available.");
-    println!("Run this from a terminal after closing Codex Desktop:");
+    println!("Run this from a terminal after closing ChatGPT Desktop:");
     println!("{}", manual_install_command(package_path));
 }
 
@@ -1774,7 +1805,7 @@ fn maybe_notify_manual_install_required(
         paths,
         enabled,
         "manual_install_required",
-        "Codex update needs manual install",
+        "ChatGPT Desktop update needs manual install",
         "No graphical authentication agent was found for pkexec. Run codex-update-manager status for details.",
     )
 }
@@ -1782,7 +1813,7 @@ fn maybe_notify_manual_install_required(
 fn maybe_send_manual_install_required_notification(enabled: bool) {
     maybe_send_notification(
         enabled,
-        "Codex update needs manual install",
+        "ChatGPT Desktop update needs manual install",
         "No graphical authentication agent was found for pkexec. Run codex-update-manager status for details.",
     );
 }
@@ -1868,7 +1899,7 @@ fn defer_install_until_next_app_exit(
     if let Some(event_key) = install_auth_required_event_key(state) {
         if state.notified_events.insert(event_key) {
             let _ = notify::send(
-                "Codex update needs permission",
+                "ChatGPT Desktop update needs permission",
                 "The ready update will retry after the next app close. Approve the system authentication dialog to install it.",
             );
         }
@@ -1889,7 +1920,7 @@ fn notify_failure(
         paths,
         config.notifications,
         "build_failed",
-        "Codex update failed",
+        "ChatGPT Desktop update failed",
         &body,
     )
 }
@@ -2319,7 +2350,9 @@ mod tests {
         let mut state = PersistedState::new(true);
         run_check_cycle(&config, &mut state, &paths).await?;
 
-        let expected_dmg_path = config.workspace_root.join("downloads/Codex.dmg");
+        let expected_dmg_path = config
+            .workspace_root
+            .join(format!("downloads/Codex-{sha256}.dmg"));
         assert_eq!(state.status, UpdateStatus::Idle);
         assert_eq!(state.candidate_version, None);
         assert_eq!(state.dmg_sha256.as_deref(), Some(sha256));
@@ -2606,11 +2639,18 @@ mod tests {
     #[test]
     fn daemon_reconcile_reloads_waiting_state_written_by_another_process() -> Result<()> {
         let _env_guard = crate::test_util::env_lock();
+        let _restore_env = crate::test_util::EnvRestoreGuard::capture(&[
+            "CODEX_UPDATE_MANAGER_ASSUME_NO_POLKIT_AGENT",
+            "CODEX_LINUX_SETTINGS_FILE",
+        ]);
         let runtime = tokio::runtime::Runtime::new()?;
-        let previous_no_agent = std::env::var_os("CODEX_UPDATE_MANAGER_ASSUME_NO_POLKIT_AGENT");
         std::env::set_var("CODEX_UPDATE_MANAGER_ASSUME_NO_POLKIT_AGENT", "1");
 
         let temp = tempfile::tempdir()?;
+        std::env::set_var(
+            "CODEX_LINUX_SETTINGS_FILE",
+            temp.path().join("isolated-settings.json"),
+        );
         let paths = test_paths(temp.path());
         paths.ensure_dirs()?;
         let config = test_config(temp.path());
@@ -2638,12 +2678,6 @@ mod tests {
             &mut stale_daemon_state,
             &paths,
         ));
-
-        if let Some(value) = previous_no_agent {
-            std::env::set_var("CODEX_UPDATE_MANAGER_ASSUME_NO_POLKIT_AGENT", value);
-        } else {
-            std::env::remove_var("CODEX_UPDATE_MANAGER_ASSUME_NO_POLKIT_AGENT");
-        }
 
         result?;
         assert_eq!(stale_daemon_state.status, UpdateStatus::ReadyToInstall);
@@ -3349,6 +3383,8 @@ mod tests {
         state.status = UpdateStatus::ReadyToInstall;
         state.installed_version = "2026.04.28.082247-abcdef12.fc43".to_string();
         state.candidate_version = Some("2026.04.28.082247+abcdef12".to_string());
+        state.rollback_blocked_candidate_version = Some("2026.04.20.120000".to_string());
+        state.rollback_blocked_dmg_sha256 = Some("rolled-back-dmg-sha256".to_string());
         state.error_message = Some("authentication was not obtained".to_string());
         state
             .notified_events
@@ -3361,6 +3397,8 @@ mod tests {
 
         assert_eq!(state.status, UpdateStatus::Installed);
         assert_eq!(state.candidate_version, None);
+        assert_eq!(state.rollback_blocked_candidate_version, None);
+        assert_eq!(state.rollback_blocked_dmg_sha256, None);
         assert_eq!(state.error_message, None);
         assert!(state.notified_events.is_empty());
         Ok(())
@@ -3663,6 +3701,56 @@ mod tests {
         assert_eq!(compare_generated_versions("0.34.1", "0.35.0"), None);
     }
 
+    #[test]
+    fn rollback_blocks_same_dmg_hash_at_a_different_timestamp() {
+        let mut state = PersistedState::new(true);
+        state.rollback_blocked_candidate_version = Some("2026.05.04.131500+badcafe0".to_string());
+        state.rollback_blocked_dmg_sha256 = Some("same-full-sha256".to_string());
+
+        assert!(rollback_blocks_candidate(
+            &state,
+            "same-full-sha256",
+            "2026.05.05.090000+badcafe0"
+        ));
+    }
+
+    #[test]
+    fn rollback_hash_mismatch_is_not_overridden_by_legacy_version_match() {
+        let mut state = PersistedState::new(true);
+        state.rollback_blocked_candidate_version = Some("2026.05.04.131500".to_string());
+        state.rollback_blocked_dmg_sha256 = Some("rolled-back-sha256".to_string());
+
+        assert!(!rollback_blocks_candidate(
+            &state,
+            "different-sha256",
+            "2026.05.04.131500+different"
+        ));
+    }
+
+    #[test]
+    fn rollback_legacy_version_fallback_applies_only_without_recorded_hash() {
+        let mut state = PersistedState::new(true);
+        state.rollback_blocked_candidate_version = Some("2026.05.04.131500".to_string());
+
+        assert!(rollback_blocks_candidate(
+            &state,
+            "unrecorded-sha256",
+            "2026.05.04.131500+newhash00"
+        ));
+    }
+
+    #[test]
+    fn successful_install_clears_both_rollback_block_identifiers() {
+        let mut state = PersistedState::new(true);
+        state.rollback_blocked_candidate_version = Some("2026.05.04.131500".to_string());
+        state.rollback_blocked_dmg_sha256 = Some("rolled-back-sha256".to_string());
+
+        clear_rollback_blocked_candidate(&mut state);
+
+        assert_eq!(state.rollback_blocked_candidate_version, None);
+        assert_eq!(state.rollback_blocked_dmg_sha256, None);
+    }
+
     #[tokio::test]
     async fn interrupted_install_becomes_installed_when_candidate_is_already_present() -> Result<()>
     {
@@ -3689,6 +3777,8 @@ mod tests {
         state.status = UpdateStatus::Installing;
         state.installed_version = "2026.04.01.035152".to_string();
         state.candidate_version = Some("2026.03.27.025604+1086e799".to_string());
+        state.rollback_blocked_candidate_version = Some("2026.03.20.120000".to_string());
+        state.rollback_blocked_dmg_sha256 = Some("rolled-back-dmg-sha256".to_string());
         state.artifact_paths.package_path = Some(package_path);
         state.artifact_paths.workspace_dir = Some(
             temp.path()
@@ -3699,6 +3789,8 @@ mod tests {
 
         assert_eq!(state.status, UpdateStatus::Installed);
         assert_eq!(state.candidate_version, None);
+        assert_eq!(state.rollback_blocked_candidate_version, None);
+        assert_eq!(state.rollback_blocked_dmg_sha256, None);
         assert_eq!(state.artifact_paths.package_path, None);
         assert_eq!(state.artifact_paths.workspace_dir, None);
         assert_eq!(state.error_message, None);
@@ -3762,7 +3854,7 @@ mod tests {
             &paths,
             false,
             "ready_to_install",
-            "Codex Desktop update ready",
+            "ChatGPT Desktop update ready",
             "An update is ready to install.",
         )?;
         let notified_count = state.notified_events.len();
@@ -3771,7 +3863,7 @@ mod tests {
             &paths,
             false,
             "ready_to_install",
-            "Codex Desktop update ready",
+            "ChatGPT Desktop update ready",
             "An update is ready to install.",
         )?;
 
