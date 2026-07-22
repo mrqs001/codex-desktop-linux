@@ -13,23 +13,46 @@ let
   testFeatureIds = [
     "persistent-status-panel"
     "appshots"
+    "codex-wrapper-updater"
+    "directory-only-working-tree-watch"
     "frameless-titlebar"
     "global-dictation"
     "mcp-helper-reaper"
     "remote-mobile-control"
     "pet-overlay"
     "open-target-discovery"
+    "remote-control-ui"
+    "ui-tweaks"
     "appshots"
   ];
   normalizedTestFeatureIds = [
     "appshots"
+    "codex-wrapper-updater"
+    "directory-only-working-tree-watch"
     "frameless-titlebar"
     "global-dictation"
     "mcp-helper-reaper"
     "open-target-discovery"
     "persistent-status-panel"
     "pet-overlay"
+    "remote-control-ui"
     "remote-mobile-control"
+    "ui-tweaks"
+  ];
+  watchdogFeatureIds = (builtins.fromJSON (builtins.readFile ../scripts/ci/watchdog-linux-features.json)).enabled;
+  normalizedWatchdogFeatureIds = [
+    "appshots"
+    "codex-wrapper-updater"
+    "directory-only-working-tree-watch"
+    "frameless-titlebar"
+    "global-dictation"
+    "mcp-helper-reaper"
+    "node-repl-reaper"
+    "open-target-discovery"
+    "persistent-status-panel"
+    "remote-control-ui"
+    "remote-mobile-control"
+    "ui-tweaks"
   ];
 
   evalHomeManager = moduleConfig:
@@ -126,11 +149,15 @@ let
     linuxFeatureIds = [
       "remote-mobile-control"
       "frameless-titlebar"
+      "codex-wrapper-updater"
+      "directory-only-working-tree-watch"
       "global-dictation"
       "persistent-status-panel"
       "mcp-helper-reaper"
       "pet-overlay"
       "open-target-discovery"
+      "remote-control-ui"
+      "ui-tweaks"
       "appshots"
       "appshots"
     ];
@@ -170,6 +197,11 @@ let
   invalidBuilder = builtins.tryEval (
     (packages.codex-desktop.override {
       linuxFeatureIds = [ "not-nix-compatible" ];
+    }).drvPath
+  );
+  shallowRepositoryWatchBuilder = builtins.tryEval (
+    (packages.codex-desktop.override {
+      linuxFeatureIds = [ "shallow-repository-watches" ];
     }).drvPath
   );
   invalidHomeManager = builtins.tryEval (
@@ -261,6 +293,9 @@ assert lib.assertMsg
   (linuxFeatures.normalize testFeatureIds == normalizedTestFeatureIds)
   "Nix Linux feature IDs must be sorted and deduplicated";
 assert lib.assertMsg
+  (linuxFeatures.normalize watchdogFeatureIds == normalizedWatchdogFeatureIds)
+  "the committed watchdog Linux feature profile drifted from the Nix-supported profile";
+assert lib.assertMsg
   ((homePackage defaultConfig).drvPath == packages.codex-desktop.drvPath)
   "the Home Manager default package changed";
 assert lib.assertMsg
@@ -288,6 +323,9 @@ assert lib.assertMsg
   ((nixosPackage customConfig).drvPath == customPackage.drvPath)
   "the NixOS custom package override lost precedence";
 assert lib.assertMsg (!invalidBuilder.success) "the package builder accepted an unsupported feature";
+assert lib.assertMsg
+  shallowRepositoryWatchBuilder.success
+  "the package builder rejected the shallow repository-watch feature";
 assert lib.assertMsg (!invalidHomeManager.success) "Home Manager accepted an unsupported feature";
 assert lib.assertMsg (!invalidNixOS.success) "NixOS accepted an unsupported feature";
 assert lib.assertMsg
