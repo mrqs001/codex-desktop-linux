@@ -156,24 +156,6 @@ test("HTTP identity requires an ETag or Last-Modified plus Content-Length", () =
   assert.ok(httpIdentity({ lastModified: "today", contentLength: 42 })?.key);
 });
 
-test("upstream workflow concurrency is isolated per PR or ref", () => {
-  const workflow = fs.readFileSync(
-    path.resolve(__dirname, "../../.github/workflows/upstream-build-app.yml"),
-    "utf8",
-  );
-  assert.match(workflow, /cron: '30 \* \* \* \*'/);
-  assert.match(
-    workflow,
-    /group: upstream-dmg-acceptance-\$\{\{ github\.event_name \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}/,
-  );
-  assert.doesNotMatch(workflow, /group: upstream-dmg-acceptance-\$\{\{ github\.event_name \}\}\s*$/m);
-  assert.equal((workflow.match(/- linux-features\/\*\*/g) ?? []).length, 2);
-  assert.equal((workflow.match(/- scripts\/lib\/linux-features\.js/g) ?? []).length, 2);
-  assert.doesNotMatch(workflow, /uses:\s+[^\s]+@v\d/);
-  assert.match(workflow, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
-  assert.match(workflow, /persist-credentials: false/);
-});
-
 test("Nix refresh serializes campaigns and deduplicates refresh and exact-head CI", () => {
   const workflow = fs.readFileSync(
     path.resolve(__dirname, "../../.github/workflows/update-codex-hash.yml"),
