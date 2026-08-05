@@ -124,12 +124,9 @@ else
     cat >"$FEATURE_CONFIG" <<'JSON'
 {
   "enabled": [
-    "agent-workspace",
     "appshots",
     "codex-wrapper-updater",
-    "copilot-reasoning-effort",
     "open-target-discovery",
-    "read-aloud",
     "read-aloud-mcp",
     "remote-mobile-control",
     "thorium-chrome-plugin",
