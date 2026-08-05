@@ -58,7 +58,34 @@ resolve_script_dir() {
     cd -P "$(dirname "$source")" && pwd
 }
 
+capture_launched_desktop_entry() {
+    unset CODEX_LINUX_LAUNCHED_DESKTOP_ENTRY
+
+    local desktop_file="${GIO_LAUNCHED_DESKTOP_FILE:-}"
+    local launched_pid="${GIO_LAUNCHED_DESKTOP_FILE_PID:-}"
+    local current_pid="${BASHPID:-$$}"
+    local desktop_file_name
+    local desktop_entry
+
+    [ "$launched_pid" = "$current_pid" ] || return 0
+    case "$desktop_file" in
+        /*) ;;
+        *) return 0 ;;
+    esac
+
+    desktop_file_name="${desktop_file##*/}"
+    case "$desktop_file_name" in
+        *.desktop) desktop_entry="${desktop_file_name%.desktop}" ;;
+        *) return 0 ;;
+    esac
+    [ -n "$desktop_entry" ] || return 0
+
+    CODEX_LINUX_LAUNCHED_DESKTOP_ENTRY="$desktop_entry"
+    export CODEX_LINUX_LAUNCHED_DESKTOP_ENTRY
+}
+
 SCRIPT_DIR="$(resolve_script_dir)"
+capture_launched_desktop_entry
 if [ -z "${CODEX_HOME:-}" ]; then
     if [ -n "${HOME:-}" ]; then
         CODEX_HOME="$HOME/.codex"
@@ -80,11 +107,7 @@ APP_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$CODEX_LINUX_APP_ID"
 configure_runtime_tmpdir() {
     [ -z "${TMPDIR:-}" ] || return 0
 
-    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ] && [ -w "$XDG_RUNTIME_DIR" ]; then
-        TMPDIR="$XDG_RUNTIME_DIR/$CODEX_LINUX_APP_ID/tmp"
-    else
-        TMPDIR="$APP_STATE_DIR/tmp"
-    fi
+    TMPDIR="$APP_STATE_DIR/tmp"
     mkdir -p "$TMPDIR"
     chmod 700 "$TMPDIR"
     export TMPDIR
@@ -111,6 +134,13 @@ MULTI_LAUNCH_REQUESTED=0
 MULTI_LAUNCH_ACTIVE=0
 CODEX_LINUX_INSTANCE_ID=""
 LAUNCHER_ARGS=()
+
+# Multi-launch requests are one launcher invocation wide. Keep the public
+# compatibility flag long enough to parse this invocation, but do not leak it
+# into Electron or descendants where it would turn later normal launches into
+# additional side-by-side instances.
+CODEX_MULTI_LAUNCH_REQUEST="${CODEX_MULTI_LAUNCH:-}"
+unset CODEX_MULTI_LAUNCH
 
 # Internal marker consumed by patched Electron bundles; never trust inheritance.
 unset CODEX_LINUX_MULTI_LAUNCH
@@ -197,7 +227,7 @@ parse_launcher_args() {
     local passthrough=0
 
     LAUNCHER_ARGS=()
-    if early_truthy_env_value "${CODEX_MULTI_LAUNCH:-}"; then
+    if early_truthy_env_value "$CODEX_MULTI_LAUNCH_REQUEST"; then
         MULTI_LAUNCH_REQUESTED=1
     fi
 
@@ -316,6 +346,7 @@ Launches the $CODEX_LINUX_APP_DISPLAY_NAME app.
 Options:
   -h, --help                  Show this help message and exit
   --new-instance              Start a separate app instance on the first free port in the multi-launch range
+  --show                      Show or focus the main window
   --new-chat                  Open the main window on a new chat
   --quick-chat                Open a projectless quick chat
   --prompt-chat               Show the compact prompt for a new chat
@@ -350,7 +381,7 @@ Environment:
   CODEX_FORCE_RENDERER_ACCESSIBILITY=auto|0|1
                               Override --force-renderer-accessibility; auto forces it only when assistive
                               technology is detected and never under WSLg or native wayland-gpu
-  CODEX_MULTI_LAUNCH=1        Treat normal launches like --new-instance
+  CODEX_MULTI_LAUNCH=1        Treat this launcher invocation like --new-instance
   CODEX_MULTI_LAUNCH_PORT_RANGE=START-END
                               Port allocation range for --new-instance (default: CODEX_WEBVIEW_PORT through +4)
 
@@ -958,6 +989,169 @@ chrome_extension_host_arch() {
     esac
 }
 
+write_chrome_native_host_launcher() {
+    local cache_root="$1"
+    local launcher_path="$cache_root/native-host"
+    local tmp_path
+
+    make_path_owner_trusted "$cache_root" || return 1
+    tmp_path="$(mktemp "$cache_root/.native-host.tmp.XXXXXX")" || return 1
+    if ! printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -euo pipefail' \
+        'CODEX_CHROME_NATIVE_HOST_LAUNCHER_V2=1' \
+        'cache_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"' \
+        'run_proxy_probe() {' \
+        '    local output_file timeout_file probe_pid watchdog_pid rc=0 self_pid' \
+        '    command -v setsid >/dev/null 2>&1 || return 1' \
+        '    [ -r /proc/self/stat ] || return 1' \
+        '    output_file="$(mktemp "${TMPDIR:-/tmp}/codex-chrome-proxy-probe.XXXXXX")" || return 1' \
+        '    timeout_file="$(mktemp "${TMPDIR:-/tmp}/codex-chrome-proxy-timeout.XXXXXX")" || {' \
+        '        rm -f -- "$output_file"' \
+        '        return 1' \
+        '    }' \
+        '    self_pid=${BASHPID:-$$}' \
+        '    setsid "$@" >"$output_file" 2>/dev/null &' \
+        '    probe_pid=$!' \
+        '    (' \
+        '        sleep 0.5' \
+        '        [ -r "/proc/$probe_pid/stat" ] || exit 0' \
+        '        local stat_line rest' \
+        '        stat_line=$(< "/proc/$probe_pid/stat") || exit 0' \
+        '        rest=${stat_line##*) }' \
+        '        set -- $rest' \
+        '        [ "${2:-}" = "$self_pid" ] || exit 0' \
+        '        printf 1 > "$timeout_file"' \
+        '        if kill -0 "$probe_pid" 2>/dev/null; then' \
+        '            kill -TERM -- "-$probe_pid" 2>/dev/null || kill -TERM "$probe_pid" 2>/dev/null || true' \
+        '            sleep 0.1' \
+        '            kill -KILL -- "-$probe_pid" 2>/dev/null || kill -KILL "$probe_pid" 2>/dev/null || true' \
+        '        fi' \
+        '    ) >/dev/null 2>&1 &' \
+        '    watchdog_pid=$!' \
+        '    wait "$probe_pid" || rc=$?' \
+        '    if [ -s "$timeout_file" ]; then' \
+        '        wait "$watchdog_pid" 2>/dev/null || true' \
+        '        rc=124' \
+        '    else' \
+        '        kill "$watchdog_pid" 2>/dev/null || true' \
+        '        wait "$watchdog_pid" 2>/dev/null || true' \
+        '    fi' \
+        '    if [ "$rc" -eq 0 ]; then' \
+        '        cat "$output_file"' \
+        '    fi' \
+        '    rm -f -- "$output_file" "$timeout_file"' \
+        '    return "$rc"' \
+        '}' \
+        'http_proxy_inherited=0' \
+        'https_proxy_inherited=0' \
+        'all_proxy_inherited=0' \
+        'no_proxy_inherited=0' \
+        '[ -z "${HTTP_PROXY+x}" ] && [ -z "${http_proxy+x}" ] || http_proxy_inherited=1' \
+        '[ -z "${HTTPS_PROXY+x}" ] && [ -z "${https_proxy+x}" ] || https_proxy_inherited=1' \
+        '[ -z "${ALL_PROXY+x}" ] && [ -z "${all_proxy+x}" ] || all_proxy_inherited=1' \
+        '[ -z "${NO_PROXY+x}" ] && [ -z "${no_proxy+x}" ] || no_proxy_inherited=1' \
+        'while IFS="=" read -r name value; do' \
+        '    case "$name" in' \
+        '        HTTP_PROXY|http_proxy) [ "$http_proxy_inherited" -eq 1 ] || export "$name=$value" ;;' \
+        '        HTTPS_PROXY|https_proxy) [ "$https_proxy_inherited" -eq 1 ] || export "$name=$value" ;;' \
+        '        ALL_PROXY|all_proxy) [ "$all_proxy_inherited" -eq 1 ] || export "$name=$value" ;;' \
+        '        NO_PROXY|no_proxy) [ "$no_proxy_inherited" -eq 1 ] || export "$name=$value" ;;' \
+        '    esac' \
+        'done < <(run_proxy_probe systemctl --user show-environment 2>/dev/null || true)' \
+        'copy_proxy_pair() {' \
+        '    local upper_name="$1" lower_name="$2"' \
+        '    if [ -z "${!upper_name+x}" ] && [ -n "${!lower_name+x}" ]; then' \
+        '        export "$upper_name=${!lower_name}"' \
+        '    elif [ -z "${!lower_name+x}" ] && [ -n "${!upper_name+x}" ]; then' \
+        '        export "$lower_name=${!upper_name}"' \
+        '    fi' \
+        '}' \
+        'copy_proxy_family() {' \
+        '    local source_upper="$1" source_lower="$2" target_upper="$3" target_lower="$4" value' \
+        '    [ -z "${!target_upper+x}" ] && [ -z "${!target_lower+x}" ] || return 0' \
+        '    if [ -n "${!source_upper+x}" ]; then' \
+        '        value="${!source_upper}"' \
+        '    elif [ -n "${!source_lower+x}" ]; then' \
+        '        value="${!source_lower}"' \
+        '    else' \
+        '        return 0' \
+        '    fi' \
+        '    export "$target_upper=$value" "$target_lower=$value"' \
+        '}' \
+        'read_gnome_proxy_value() {' \
+        '    local schema="$1" key="$2" value' \
+        '    value="$(run_proxy_probe gsettings get "$schema" "$key" 2>/dev/null)" || return 1' \
+        '    value="$(printf "%s" "$value" | tr -d "\047")"' \
+        '    printf "%s\\n" "$value"' \
+        '}' \
+        'read_gnome_proxy_ignore_hosts() {' \
+        '    local value' \
+        '    value="$(run_proxy_probe gsettings get org.gnome.system.proxy ignore-hosts 2>/dev/null)" || return 1' \
+        '    value="${value#@as }"' \
+        '    value="${value#[}"' \
+        '    value="${value%]}"' \
+        '    value="$(printf "%s" "$value" | tr -d "\047" | sed "s/, */,/g")"' \
+        '    printf "%s\\n" "$value"' \
+        '}' \
+        'set_gnome_proxy_pair() {' \
+        '    local upper_name="$1" lower_name="$2" schema="$3" scheme="$4"' \
+        '    local host port value' \
+        '    [ -z "${!upper_name+x}" ] && [ -z "${!lower_name+x}" ] || return 0' \
+        '    host="$(read_gnome_proxy_value "$schema" host)" || return 0' \
+        '    port="$(read_gnome_proxy_value "$schema" port)" || return 0' \
+        '    [ -n "$host" ] || return 0' \
+        '    case "$port" in ""|*[!0-9]*) return 0 ;; esac' \
+        '    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 0' \
+        '    case "$host" in \[*\]) ;; *:*) host="[$host]" ;; esac' \
+        '    value="$scheme://$host:$port"' \
+        '    [ "$scheme" != socks5 ] || value="$value/"' \
+        '    export "$upper_name=$value" "$lower_name=$value"' \
+        '}' \
+        'set_gnome_no_proxy_pair() {' \
+        '    local value' \
+        '    [ -z "${NO_PROXY+x}" ] && [ -z "${no_proxy+x}" ] || return 0' \
+        '    value="$(read_gnome_proxy_ignore_hosts)" || return 0' \
+        '    [ -n "$value" ] || return 0' \
+        '    export "NO_PROXY=$value" "no_proxy=$value"' \
+        '}' \
+        'copy_proxy_pair HTTP_PROXY http_proxy' \
+        'copy_proxy_pair HTTPS_PROXY https_proxy' \
+        'copy_proxy_pair ALL_PROXY all_proxy' \
+        'copy_proxy_pair NO_PROXY no_proxy' \
+        'gnome_proxy_mode="$(read_gnome_proxy_value org.gnome.system.proxy mode 2>/dev/null || true)"' \
+        'if [ "$gnome_proxy_mode" = manual ]; then' \
+        '    set_gnome_proxy_pair HTTP_PROXY http_proxy org.gnome.system.proxy.http http' \
+        '    gnome_use_same_proxy="$(read_gnome_proxy_value org.gnome.system.proxy use-same-proxy 2>/dev/null || true)"' \
+        '    if [ "$gnome_use_same_proxy" = true ]; then' \
+        '        copy_proxy_family HTTP_PROXY http_proxy HTTPS_PROXY https_proxy' \
+        '        copy_proxy_family HTTP_PROXY http_proxy ALL_PROXY all_proxy' \
+        '    else' \
+        '        set_gnome_proxy_pair HTTPS_PROXY https_proxy org.gnome.system.proxy.https http' \
+        '        set_gnome_proxy_pair ALL_PROXY all_proxy org.gnome.system.proxy.socks socks5' \
+        '    fi' \
+        '    set_gnome_no_proxy_pair' \
+        'fi' \
+        'case "$(uname -m)" in' \
+        '    x86_64) extension_arch=x64 ;;' \
+        '    aarch64|arm64) extension_arch=arm64 ;;' \
+        '    *) exit 1 ;;' \
+        'esac' \
+        'host_path="$cache_root/latest/extension-host/linux/$extension_arch/extension-host"' \
+        'exec "$host_path" "$@"' > "$tmp_path"; then
+        rm -f -- "$tmp_path"
+        return 1
+    fi
+    if [ -d "$launcher_path" ] && [ ! -L "$launcher_path" ]; then
+        remove_tree_if_exists "$launcher_path"
+    fi
+    if ! chmod 0755 "$tmp_path" || ! mv -fT -- "$tmp_path" "$launcher_path"; then
+        rm -f -- "$tmp_path"
+        return 1
+    fi
+    printf '%s\n' "$launcher_path"
+}
+
 write_chrome_native_host_manifests() {
     local host_path="$1"
     local plugin_dir="$2"
@@ -977,22 +1171,15 @@ scripts_dir = plugin_dir / "scripts"
 extension_id = None
 host_name = None
 
-extension_id_json = scripts_dir / "extension-id.json"
+extension_ids_json = scripts_dir / "extension-ids.json"
 try:
-    data = json.loads(extension_id_json.read_text(encoding="utf-8"))
-    extension_id = data.get("extensionId")
+    data = json.loads(extension_ids_json.read_text(encoding="utf-8"))
+    extension_ids = data.get("extensionIds")
+    if isinstance(extension_ids, list) and extension_ids:
+        extension_id = extension_ids[0]
     host_name = data.get("extensionHostName")
-except OSError:
+except (OSError, json.JSONDecodeError):
     pass
-
-if extension_id is None or host_name is None:
-    install_manifest = (scripts_dir / "installManifest.mjs").read_text(encoding="utf-8")
-    extension_id_match = re.search(r'extensionId\s*:\s*"([a-p]{32})"', install_manifest)
-    host_name_match = re.search(r'extensionHostName\s*:\s*"([A-Za-z0-9_.]+)"', install_manifest)
-    if extension_id is None and extension_id_match is not None:
-        extension_id = extension_id_match.group(1)
-    if host_name is None and host_name_match is not None:
-        host_name = host_name_match.group(1)
 
 if not isinstance(extension_id, str) or re.fullmatch(r"[a-p]{32}", extension_id) is None:
     raise SystemExit("Invalid Chrome extension id in bundled plugin metadata")
@@ -1060,6 +1247,11 @@ sync_chrome_bundled_plugin_cache() {
     local cache_install_manifest
     local cache_parent
     local tmp_plugin
+    local managed_cache_root
+    local managed_cache_plugin
+    local managed_cache_client
+    local managed_tmp_plugin
+    local managed_backup_plugin
     local marketplace_root
     local marketplace_plugins_dir
     local marketplace_plugin_link
@@ -1095,7 +1287,12 @@ sync_chrome_bundled_plugin_cache() {
     version="$(bundled_plugin_version "$plugin_json" 2>/dev/null || true)"
     [ -n "$version" ] || return 0
 
-    cache_root="$codex_home/plugins/cache/openai-bundled/chrome"
+    # Keep the Linux native-host/runtime copy outside app-server's managed
+    # plugin cache. plugin/install replaces
+    # $CODEX_HOME/plugins/cache/openai-bundled/chrome and would otherwise
+    # remove both the marketplace source link and the native-host launcher
+    # while the renderer is still finishing the install.
+    cache_root="$codex_home/plugins/linux-runtime-cache/openai-bundled/chrome"
     cache_plugin="$cache_root/$version"
     cache_host="$cache_plugin/extension-host/linux/$extension_arch/extension-host"
     cache_client="$cache_plugin/scripts/browser-client.mjs"
@@ -1104,8 +1301,8 @@ sync_chrome_bundled_plugin_cache() {
     if path_has_unsafe_write \
         "$codex_home" \
         "$codex_home/plugins" \
-        "$codex_home/plugins/cache" \
-        "$codex_home/plugins/cache/openai-bundled" \
+        "$codex_home/plugins/linux-runtime-cache" \
+        "$codex_home/plugins/linux-runtime-cache/openai-bundled" \
         "$cache_root" || tree_has_unsafe_write "$cache_plugin"; then
         cache_was_untrusted=1
     fi
@@ -1113,8 +1310,8 @@ sync_chrome_bundled_plugin_cache() {
     if ! make_path_owner_trusted \
         "$codex_home" \
         "$codex_home/plugins" \
-        "$codex_home/plugins/cache" \
-        "$codex_home/plugins/cache/openai-bundled" \
+        "$codex_home/plugins/linux-runtime-cache" \
+        "$codex_home/plugins/linux-runtime-cache/openai-bundled" \
         "$cache_root"; then
         echo "Chrome plugin cache ancestors could not be hardened; skipping cache and native-host manifest sync."
         return 0
@@ -1138,7 +1335,7 @@ sync_chrome_bundled_plugin_cache() {
             scripts/check-extension-installed.js \
             scripts/check-native-host-manifest.js \
             scripts/chrome-is-running.js \
-            scripts/extension-id.json \
+            scripts/extension-ids.json \
             scripts/installed-browsers.js \
             scripts/open-chrome-window.js; do
             [ -f "$source_plugin/$relative" ] || continue
@@ -1157,8 +1354,8 @@ sync_chrome_bundled_plugin_cache() {
         if ! make_path_owner_trusted \
             "$codex_home" \
             "$codex_home/plugins" \
-            "$codex_home/plugins/cache" \
-            "$codex_home/plugins/cache/openai-bundled" \
+            "$codex_home/plugins/linux-runtime-cache" \
+            "$codex_home/plugins/linux-runtime-cache/openai-bundled" \
             "$cache_root" \
             "$cache_parent"; then
             echo "Chrome plugin cache parent could not be hardened; skipping cache and native-host manifest sync."
@@ -1188,14 +1385,58 @@ sync_chrome_bundled_plugin_cache() {
     fi
     replace_symlink "$version" "$cache_root/latest"
 
+    # app-server keys its managed plugin cache by the upstream version. Linux
+    # compatibility patches do not change that version, so an already-installed
+    # Chrome plugin can otherwise keep stale JavaScript after an RPM upgrade.
+    # Refresh an existing same-version install from the bundled source while
+    # leaving this app-server-owned tree writable and outside the trusted native
+    # host/runtime cache above.
+    managed_cache_root="$codex_home/plugins/cache/openai-bundled/chrome"
+    managed_cache_plugin="$managed_cache_root/$version"
+    managed_cache_client="$managed_cache_plugin/scripts/browser-client.mjs"
+    if [ -d "$managed_cache_root" ] && [ ! -L "$managed_cache_root" ] && \
+        [ -d "$managed_cache_plugin" ] && [ ! -L "$managed_cache_plugin" ] && \
+        { [ ! -f "$managed_cache_client" ] || ! cmp -s "$source_client" "$managed_cache_client"; }; then
+        managed_tmp_plugin="$managed_cache_root/.chrome-$version.linux-refresh.$$"
+        managed_backup_plugin="$managed_cache_root/.chrome-$version.linux-backup.$$"
+        if ! remove_tree_if_exists "$managed_tmp_plugin" || \
+           ! remove_tree_if_exists "$managed_backup_plugin"; then
+            echo "Chrome app-server cache refresh preparation failed; continuing with the existing install."
+        elif cp -R "$source_plugin" "$managed_tmp_plugin"; then
+            make_tree_owner_writable "$managed_tmp_plugin"
+            chmod --reference="$managed_cache_plugin" "$managed_tmp_plugin" 2>/dev/null || true
+            if ! find "$managed_tmp_plugin" -type f -name '*:com.apple.*' -delete; then
+                remove_tree_if_exists "$managed_tmp_plugin" || true
+                echo "Chrome app-server cache refresh cleanup failed; continuing with the existing install."
+            elif ! mv -T -- "$managed_cache_plugin" "$managed_backup_plugin"; then
+                remove_tree_if_exists "$managed_tmp_plugin" || true
+                echo "Chrome app-server cache refresh failed; existing cache was preserved."
+            elif mv -T -- "$managed_tmp_plugin" "$managed_cache_plugin"; then
+                remove_tree_if_exists "$managed_backup_plugin" || \
+                    echo "Chrome app-server cache backup cleanup failed: $managed_backup_plugin"
+                echo "Chrome app-server cache refreshed from bundled resources: $managed_cache_plugin"
+            else
+                remove_tree_if_exists "$managed_tmp_plugin" || true
+                if mv -T -- "$managed_backup_plugin" "$managed_cache_plugin"; then
+                    echo "Chrome app-server cache refresh failed; previous cache was restored."
+                else
+                    echo "Chrome app-server cache refresh failed and the previous cache could not be restored: $managed_backup_plugin"
+                fi
+            fi
+        else
+            remove_tree_if_exists "$managed_tmp_plugin" || true
+            echo "Chrome app-server cache refresh failed; continuing with the existing install."
+        fi
+    fi
+
     marketplace_root="$codex_home/.tmp/bundled-marketplaces/openai-bundled"
     marketplace_plugins_dir="$marketplace_root/.agents/plugins"
     marketplace_plugin_link="$marketplace_root/plugins/chrome"
     mkdir -p "$marketplace_plugins_dir" "$marketplace_root/plugins"
     replace_symlink "$cache_root/latest" "$marketplace_plugin_link"
 
-    host_path="$cache_root/latest/extension-host/linux/$extension_arch/extension-host"
-    [ -x "$host_path" ] || return 0
+    [ -x "$cache_root/latest/extension-host/linux/$extension_arch/extension-host" ] || return 0
+    host_path="$(write_chrome_native_host_launcher "$cache_root")" || return 0
     write_chrome_native_host_manifests "$host_path" "$cache_root/latest" || \
         echo "Chrome native host manifest sync failed; continuing with existing browser manifests."
 }
@@ -2109,7 +2350,7 @@ find_running_app_pid() {
 
     if [ -f "$APP_PID_FILE" ]; then
         pid="$(cat "$APP_PID_FILE" 2>/dev/null || true)"
-        if pid_matches_executable "$pid" "$SCRIPT_DIR/electron"; then
+        if pid_matches_running_app "$pid"; then
             echo "$pid"
             return 0
         fi
@@ -2154,15 +2395,52 @@ pid_matches_app_identity() {
     [[ "$cmdline" == *"--app-id=$CODEX_LINUX_APP_ID"* ]]
 }
 
+pid_matches_appimage_install() {
+    local pid="$1"
+    local actual
+    local resident_appimage
+
+    [ -n "${APPIMAGE:-}" ] || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    [ -d "/proc/$pid" ] || return 1
+    actual="$(pid_cmdline_arg0_path "$pid")"
+    case "${actual##*/}" in
+        electron|electron\ *) ;;
+        *) return 1 ;;
+    esac
+    pid_is_current_user "$pid" || return 1
+    ! pid_is_electron_helper "$pid" || return 1
+    resident_appimage="$(pid_environ_value "$pid" APPIMAGE 2>/dev/null || true)"
+    [ -n "$resident_appimage" ] && [ "$resident_appimage" = "$APPIMAGE" ]
+}
+
+pid_matches_app_install() {
+    local pid="$1"
+
+    pid_matches_executable "$pid" "$SCRIPT_DIR/electron" || pid_matches_appimage_install "$pid"
+}
+
+pid_matches_running_app() {
+    local pid="$1"
+
+    if pid_matches_executable "$pid" "$SCRIPT_DIR/electron"; then
+        return 0
+    fi
+
+    pid_matches_appimage_install "$pid" || return 1
+    pid_matches_app_identity "$pid" || return 1
+    pid_in_same_launch_instance "$pid"
+}
+
 pid_is_foreign_codex_electron() {
     local pid="$1"
     local actual
 
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     [ -d "/proc/$pid" ] || return 1
+    ! pid_matches_app_install "$pid" || return 1
     actual="$(pid_cmdline_arg0_path "$pid")"
     [ -n "$actual" ] || return 1
-    ! pid_arg0_matches_path "$actual" "$SCRIPT_DIR/electron" || return 1
     case "${actual##*/}" in
         electron|electron\ *) ;;
         *) return 1 ;;
@@ -2180,7 +2458,7 @@ discover_running_app_pid() {
         [ -r "$proc_cmdline" ] || continue
         pid="${proc_cmdline#/proc/}"
         pid="${pid%/cmdline}"
-        if pid_matches_executable "$pid" "$SCRIPT_DIR/electron" && pid_in_same_launch_instance "$pid"; then
+        if pid_matches_running_app "$pid" && pid_in_same_launch_instance "$pid"; then
             echo "$pid"
             return 0
         fi
@@ -2265,7 +2543,7 @@ set_detected_running_app() {
 }
 
 running_app_is_active() {
-    [ -n "${RUNNING_APP_PID:-}" ] && pid_matches_executable "$RUNNING_APP_PID" "$SCRIPT_DIR/electron"
+    [ -n "${RUNNING_APP_PID:-}" ] && pid_matches_running_app "$RUNNING_APP_PID"
 }
 
 using_second_instance_handoff() {
@@ -2284,9 +2562,12 @@ detect_warm_start() {
         return 0
     fi
 
-    if runtime_recovery_scan_needed && pid="$(discover_running_app_pid)"; then
-        set_detected_running_app "$pid"
-        return 0
+    if runtime_recovery_scan_needed; then
+        if pid="$(discover_running_app_pid)"; then
+            set_detected_running_app "$pid"
+            return 0
+        fi
+        detect_cross_install_conflict
     fi
 
     if ! linux_setting_enabled "codex-linux-warm-start-enabled" 1; then
@@ -2312,13 +2593,14 @@ terminate_stale_electron_with_pidfd() {
     local pid="$1"
     local expected_start_time
 
-    pid_matches_executable "$pid" "$SCRIPT_DIR/electron" || return 1
+    pid_matches_running_app "$pid" || return 1
     expected_start_time="$(pid_start_time "$pid")" || return 1
 
     python3 - \
         "$pid" \
         "$expected_start_time" \
         "$SCRIPT_DIR/electron" \
+        "${APPIMAGE:-}" \
         "$CODEX_LINUX_APP_ID" \
         "$CODEX_LINUX_INSTANCE_ID" \
         "$MULTI_LAUNCH_ACTIVE" <<'PY'
@@ -2330,9 +2612,10 @@ import sys
 pid = int(sys.argv[1])
 expected_start_time = sys.argv[2]
 expected_executable = sys.argv[3]
-expected_app_id = sys.argv[4]
-expected_instance_id = sys.argv[5]
-expected_multi_launch = sys.argv[6] == "1"
+expected_appimage = sys.argv[4]
+expected_app_id = sys.argv[5]
+expected_instance_id = sys.argv[6]
+expected_multi_launch = sys.argv[7] == "1"
 
 if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
     print("pidfd APIs are unavailable; refusing to terminate the stale Electron process", file=sys.stderr)
@@ -2366,11 +2649,19 @@ for entry in environ_entries:
     key, value = entry.split(b"=", 1)
     environ[os.fsdecode(key)] = os.fsdecode(value)
 
+actual_executable = os.fsdecode(cmdline[0]) if cmdline else ""
+install_matches = actual_executable == expected_executable
+if not install_matches and expected_appimage:
+    install_matches = (
+        os.path.basename(actual_executable) == "electron"
+        and environ.get("APPIMAGE") == expected_appimage
+    )
+
 identity_matches = (
     actual_start_time == expected_start_time
     and actual_uid == os.geteuid()
     and bool(cmdline)
-    and os.fsdecode(cmdline[0]) == expected_executable
+    and install_matches
     and not any(part.startswith(b"--type=") for part in cmdline[1:])
     and expected_app_id in {
         environ.get("CODEX_LINUX_APP_ID"),
@@ -2475,6 +2766,7 @@ recover_unhealthy_running_app() {
 
 send_warm_start_launch_action() {
     [ "$WARM_START" -eq 1 ] || return 1
+    running_app_is_active || return 1
     [ -S "$LAUNCH_ACTION_SOCKET" ] || return 1
 
     python3 - "$LAUNCH_ACTION_SOCKET" "$@" <<'PY'
@@ -2898,7 +3190,7 @@ clear_stale_pid_file() {
 
     local pid=""
     pid="$(cat "$APP_PID_FILE" 2>/dev/null || true)"
-    if [ -z "$pid" ] || ! pid_matches_executable "$pid" "$SCRIPT_DIR/electron"; then
+    if [ -z "$pid" ] || ! pid_matches_running_app "$pid"; then
         rm -f "$APP_PID_FILE"
     fi
 }
@@ -4171,7 +4463,7 @@ launch_electron() {
         exec "$SCRIPT_DIR/electron" "${ELECTRON_LAUNCH_ARGS[@]}" "${ELECTRON_ARGS[@]}"
     ) &
     ELECTRON_PID=$!
-    if [ -n "${RUNNING_APP_PID:-}" ] && pid_matches_executable "$RUNNING_APP_PID" "$SCRIPT_DIR/electron"; then
+    if [ -n "${RUNNING_APP_PID:-}" ] && pid_matches_running_app "$RUNNING_APP_PID"; then
         echo "Preserving ChatGPT Desktop pid=$RUNNING_APP_PID liveness marker for second-instance handoff"
     else
         echo "$ELECTRON_PID" > "$APP_PID_FILE"

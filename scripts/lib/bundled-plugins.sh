@@ -1035,6 +1035,41 @@ patch_browser_client_linux_socket_dir() {
     fi
 }
 
+patch_browser_use_node_repl_process_env_import() {
+    local client="$1"
+
+    if grep -q "codexLinuxBrowserUseProcessEnv" "$client"; then
+        return 0
+    fi
+
+    python3 - "$client" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+pattern = re.compile(
+    r'import\{env as (?P<binding>[A-Za-z_$][\w$]*)\}from"node:process";'
+)
+match = pattern.search(source)
+if match is None:
+    if '"node:process"' in source:
+        print(
+            "WARN: Could not find Browser Use node:process env import — leaving browser-client.mjs unchanged",
+            file=sys.stderr,
+        )
+    raise SystemExit(0)
+
+binding = match.group("binding")
+replacement = (
+    "var codexLinuxBrowserUseProcessEnv=globalThis.nodeRepl?.env??{},"
+    f"{binding}=codexLinuxBrowserUseProcessEnv;"
+)
+path.write_text(source[:match.start()] + replacement + source[match.end():], encoding="utf-8")
+PY
+}
+
 normalize_plugin_script_executable_modes() {
     local target_plugin="$1"
     local scripts_dir="$target_plugin/scripts"
@@ -1076,6 +1111,7 @@ stage_chrome_plugin_from_upstream() {
     cp -R "$source_plugin" "$target_plugin"
     remove_macos_sidecar_files "$target_plugin"
     patch_chrome_plugin_for_linux "$target_plugin"
+    patch_browser_use_node_repl_process_env_import "$target_plugin/scripts/browser-client.mjs"
     patch_browser_use_node_repl_env_guard "$target_plugin/scripts/browser-client.mjs"
     patch_browser_use_node_repl_config_shim "$target_plugin/scripts/browser-client.mjs"
     patch_browser_use_native_pipe_import_meta_bridge "$target_plugin/scripts/browser-client.mjs"
@@ -1217,7 +1253,7 @@ PY
 patch_browser_use_node_repl_env_guard() {
     local client="$1"
 
-    if grep -Eq 'globalThis\.nodeRepl\?\.env\?\.\[[^]]+\]' "$client"; then
+    if grep -q "codexLinuxBrowserUseNodeReplEnvGuard" "$client"; then
         return 0
     fi
 
@@ -1228,28 +1264,53 @@ import sys
 
 path = Path(sys.argv[1])
 source = path.read_text(encoding="utf-8")
-pattern = re.compile(
+helper_pattern = re.compile(
     r'function (?P<helper>[A-Za-z_$][\w$]*)\((?P<key>[A-Za-z_$][\w$]*)\)\{'
     r'let (?P<value>[A-Za-z_$][\w$]*)=globalThis\.nodeRepl\?\.env\[(?P=key)\];'
     r'return typeof (?P=value)=="string"\?(?P=value):void 0\}'
 )
-match = pattern.search(source)
-if match is None:
+helper_match = helper_pattern.search(source)
+if helper_match is not None:
+    helper = helper_match.group("helper")
+    key = helper_match.group("key")
+    value = helper_match.group("value")
+    replacement = (
+        f'function {helper}({key}){{'
+        f'let {value}=globalThis.nodeRepl?.env?.[{key}];'
+        f'return typeof {value}=="string"?{value}:void 0}}'
+    )
+    source = source[:helper_match.start()] + replacement + source[helper_match.end():]
+
+# Newer Browser clients snapshot privileged node_repl state before creating the
+# browser agent. Older Linux node_repl runtimes do not expose `env`, so every
+# direct property read must preserve the upstream default behavior when it is
+# absent. Keep the object identity comparison itself unchanged.
+direct_env_pattern = re.compile(
+    r'(?P<object>\b[A-Za-z_$][\w$]*)\.env\[(?P<key>[^\]]+)\]'
+)
+source, direct_env_count = direct_env_pattern.subn(
+    r'\g<object>.env?.[\g<key>]',
+    source,
+)
+
+if helper_match is None and direct_env_count == 0:
     print(
         "WARN: Could not find Browser Use nodeRepl env guard insertion point — leaving browser-client.mjs unchanged",
         file=sys.stderr,
     )
     raise SystemExit(0)
 
-helper = match.group("helper")
-key = match.group("key")
-value = match.group("value")
-replacement = (
-    f'function {helper}({key}){{'
-    f'let {value}=globalThis.nodeRepl?.env?.[{key}];'
-    f'return typeof {value}=="string"?{value}:void 0}}'
+marker_target = (
+    "globalThis.nodeRepl?.env?.["
+    if "globalThis.nodeRepl?.env?.[" in source
+    else ".env?.["
 )
-path.write_text(source[:match.start()] + replacement + source[match.end():], encoding="utf-8")
+source = source.replace(
+    marker_target,
+    f"/*codexLinuxBrowserUseNodeReplEnvGuard*/{marker_target}",
+    1,
+)
+path.write_text(source, encoding="utf-8")
 PY
 }
 
@@ -1285,7 +1346,9 @@ value = match.group("value")
 shim = r'''
 function codexLinuxBrowserUseConfigShim() {
   let repl = globalThis.nodeRepl;
-  if (repl == null || repl.config != null) return;
+  if (repl == null) return;
+  codexLinuxBrowserUseNodeReplMethodShim(repl);
+  if (repl.config != null) return;
   let config = {
     read: async () => ({ config: await codexLinuxBrowserUseReadToml("config.toml") }),
     readRequirements: async () => ({ requirements: null }),
@@ -1306,6 +1369,30 @@ function codexLinuxBrowserUseConfigShim() {
       Object.defineProperty(prototype, "config", {
         configurable: true,
         get: () => config,
+      });
+    }
+  } catch {}
+}
+
+function codexLinuxBrowserUseNodeReplMethodShim(repl) {
+  // Older Linux node_repl builds do not expose browser notification hooks.
+  codexLinuxBrowserUseDefineNodeReplMethod(repl, "addAfterSubmittedCodeHook", () => () => undefined);
+}
+
+function codexLinuxBrowserUseDefineNodeReplMethod(repl, name, value) {
+  if (typeof repl?.[name] == "function") return;
+
+  try {
+    repl[name] = value;
+    if (typeof repl[name] == "function") return;
+  } catch {}
+
+  try {
+    let prototype = Object.getPrototypeOf(repl);
+    if (prototype != null && Object.getOwnPropertyDescriptor(prototype, name) == null) {
+      Object.defineProperty(prototype, name, {
+        configurable: true,
+        value,
       });
     }
   } catch {}
@@ -1536,6 +1623,7 @@ stage_browser_plugin_from_upstream() {
     rm -rf "$target_plugin"
     cp -R "$source_plugin" "$target_plugin"
     remove_macos_sidecar_files "$target_plugin"
+    patch_browser_use_node_repl_process_env_import "$target_client"
     patch_browser_use_node_repl_env_guard "$target_client"
     patch_browser_use_node_repl_config_shim "$target_client"
     patch_browser_use_native_pipe_import_meta_bridge "$target_client"

@@ -5,11 +5,11 @@ const {
   mainBundlePatch,
 } = require("../../../../descriptor.js");
 const {
-  applyLinuxAboutDialogPatch,
   applyLinuxAppReloadShortcutsPatch,
   applyLinuxApplicationMenuPatch,
   applyLinuxWindowOptionsPatch,
   applyLinuxNativeTitlebarPatch,
+  applyLinuxManagedWindowSystemContextMenuPatch,
   applyLinuxMenuPatch,
   applyLinuxSetIconPatch,
   applyLinuxReadyToShowWindowStatePatch,
@@ -32,7 +32,6 @@ const {
 } = require("../../../../impl/main-process/tray.js");
 const {
   applyLinuxAvatarOverlayMousePassthroughPatch,
-  applyLinuxQueryCacheInvalidationBroadcastPatch,
 } = require("../../../../impl/avatar-overlay.js");
 
 module.exports = [
@@ -53,18 +52,18 @@ module.exports = [
     },
   }),
   mainBundlePatch({
-    id: "linux-about-dialog",
-    phase: "main-bundle",
-    order: 55,
-    ciPolicy: "optional",
-    apply: (source, context) => applyLinuxAboutDialogPatch(source, context.iconPathExpression),
-  }),
-  mainBundlePatch({
     id: "linux-window-options",
     phase: "main-bundle",
     order: 50,
     ciPolicy: "required-upstream",
     apply: (source, context) => applyLinuxWindowOptionsPatch(source, context.iconAsset),
+  }),
+  mainBundlePatch({
+    id: "linux-managed-window-system-context-menu",
+    phase: "main-bundle",
+    order: 59,
+    ciPolicy: "optional",
+    apply: applyLinuxManagedWindowSystemContextMenuPatch,
   }),
   mainBundlePatch({
     id: "linux-menu",
@@ -135,13 +134,6 @@ module.exports = [
     order: 90,
     ciPolicy: "required-upstream",
     apply: applyLinuxAvatarOverlayMousePassthroughPatch,
-  }),
-  mainBundlePatch({
-    id: "linux-avatar-settings-sync",
-    phase: "main-bundle",
-    order: 92,
-    ciPolicy: "optional",
-    apply: applyLinuxQueryCacheInvalidationBroadcastPatch,
   }),
   mainBundlePatch({
     id: "linux-file-manager",
